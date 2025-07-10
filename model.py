@@ -1,0 +1,151 @@
+import torch
+from torch import nn
+from torch.cuda.amp import autocast
+from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model, TaskType
+from gnn import GNN_graphpred
+
+class ProteinDrugLLMModelLoRA(torch.nn.Module):
+    def __init__(self,
+                 tokenizer,
+                 llm_model_name="/mnt/data/vicuna-13b-v1.5",
+                 gnn_ckpt=None,
+                 freeze_gnn=True,
+                 protein_hidden_dim=768,
+                 lora_r=8,
+                 lora_alpha=16,
+                 lora_dropout=0.05):
+
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.protein_token_id = self.tokenizer.convert_tokens_to_ids("[PROTEIN]")
+        self.drug_token_id = self.tokenizer.convert_tokens_to_ids("[DRUG]")
+        self.vocab_size = len(self.tokenizer)
+
+        self.gnn = self.create_gnn(gnn_ckpt, freeze_gnn)
+        self.drug_hidden_dim = 300
+        self.protein_hidden_dim = protein_hidden_dim
+
+        base_llm = AutoModelForCausalLM.from_pretrained(
+            llm_model_name,
+            torch_dtype=torch.float16
+        )
+        base_llm.resize_token_embeddings(len(self.tokenizer))
+        base_llm.gradient_checkpointing_enable()
+        base_llm.enable_input_require_grads()
+
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+        self.llm = get_peft_model(base_llm, lora_config)
+        self.llm_hidden_size = self.llm.config.hidden_size
+
+        self.protein_proj = nn.Sequential(
+            nn.Linear(self.protein_hidden_dim, self.llm_hidden_size),
+            nn.LayerNorm(self.llm_hidden_size, eps=1e-5)
+        )
+        self.drug_proj = nn.Sequential(
+            nn.Linear(self.drug_hidden_dim, self.llm_hidden_size),
+            nn.LayerNorm(self.llm_hidden_size, eps=1e-5)
+        )
+
+    def create_gnn(self, model_path, freeze):
+        emb_dim = 300
+        gnn = GNN_graphpred(5, emb_dim, emb_dim, graph_pooling='attention', gnn_type='gcn')
+        if model_path:
+            gnn.from_pretrained(model_path)
+        if freeze:
+            for param in gnn.parameters():
+                param.requires_grad = False
+            gnn.eval()
+        return gnn
+
+    def encode_drug(self, graph):
+        device = next(self.parameters()).device
+        graph = graph.to(device)
+        graph_feat = self.gnn(graph)
+        if graph_feat.ndim == 2:
+            graph_feat = graph_feat.unsqueeze(1)
+        return graph_feat
+
+    def process_embeddings(self, protein_embeds, drug_embeds):
+        device = next(self.parameters()).device
+        protein_embeds = protein_embeds.to(device).to(torch.float16)
+        drug_embeds = drug_embeds.to(device).to(torch.float16)
+        if protein_embeds.ndim == 3:
+            protein_embeds = protein_embeds.max(dim=1).values
+        if drug_embeds.ndim == 3:
+            drug_embeds = drug_embeds.max(dim=1).values
+
+        protein_proj = self.protein_proj(protein_embeds)
+        drug_proj = self.drug_proj(drug_embeds)
+        return protein_proj, drug_proj
+
+    def get_embeddings_layer(self):
+        return self.llm.get_base_model().get_input_embeddings()
+
+    def forward(self, protein_data, drug_graph, target_text=None, max_len=25):
+        with autocast():
+            device = next(self.parameters()).device
+            protein_data = protein_data.to(device)
+            drug_graph = drug_graph.to(device)
+            drug_embed = self.encode_drug(drug_graph)
+            protein_proj, drug_proj = self.process_embeddings(protein_data, drug_embed)
+            batch_size = protein_data.size(0)
+            prompt_template = "###Human: Describe the interaction between this protein [PROTEIN] and this drug [DRUG] ###Assistant:"
+            prompts = [prompt_template] * batch_size
+            tokenized = self.tokenizer(prompts, return_tensors='pt', padding=True, truncation=True).to(device)
+            input_ids = tokenized['input_ids']
+            attention_mask = tokenized['attention_mask']
+            embed_layer = self.get_embeddings_layer()
+            inputs_embeds = embed_layer(input_ids).clone()
+
+            for i in range(batch_size):
+                p_pos = (input_ids[i] == self.protein_token_id).nonzero(as_tuple=True)[0]
+                d_pos = (input_ids[i] == self.drug_token_id).nonzero(as_tuple=True)[0]
+                if len(p_pos) == 0 or len(d_pos) == 0:
+                    msg = f"[TokenInjectionWarning] Sample {i} missing token(s) | protein_tokens={len(p_pos)} drug_tokens={len(d_pos)}"
+                    print(msg)
+                    with open("logs/error_log.txt", "a") as f: f.write(msg + "\n")
+                if len(p_pos) > 0:
+                    inputs_embeds[i, p_pos[0]] = protein_proj[i]
+                if len(d_pos) > 0:
+                    inputs_embeds[i, d_pos[0]] = drug_proj[i]
+
+            if self.training and target_text is not None:
+                labels = target_text['input_ids'].to(device).clone()
+                tgt_mask = target_text['attention_mask'].to(device)
+                labels[labels == self.tokenizer.pad_token_id] = -100
+                target_embeds = embed_layer(labels.clone().masked_fill(labels == -100, 0))
+                full_inputs_embeds = torch.cat([inputs_embeds, target_embeds], dim=1)
+                full_attention_mask = torch.cat([attention_mask, tgt_mask], dim=1)
+                input_label_pad = torch.full((batch_size, inputs_embeds.shape[1]), -100, device=device)
+                full_labels = torch.cat([input_label_pad, labels], dim=1)
+                outputs = self.llm(
+                    inputs_embeds=full_inputs_embeds,
+                    attention_mask=full_attention_mask,
+                    labels=full_labels
+                )
+                return outputs.loss
+            else:
+                with torch.no_grad():
+                    gen = self.llm.generate(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        max_new_tokens=15,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
+                        top_k=20,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        repetition_penalty=1.1,
+                        length_penalty=1.0,
+                        no_repeat_ngram_size=2
+                    )
+                return gen

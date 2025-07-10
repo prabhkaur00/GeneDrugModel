@@ -1,0 +1,28 @@
+# Core ML & DL
+torch==2.1.0+cu118
+torchvision==0.16.0+cu118
+torchaudio==2.1.0+cu118
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# PyTorch Geometric stack (torch-geometric dependencies must match torch/cu version)
+torch-scatter==2.1.1
+torch-sparse==0.6.18
+torch-cluster==1.6.3
+torch-spline-conv==1.2.2
+torch-geometric==2.3.1
+-f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+
+# Tokenization and transformers
+transformers==4.36.2
+sentencepiece==0.2.0
+peft==0.7.1
+accelerate==0.30.1
+
+# Data & utils
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+tqdm==4.66.2
+h5py==3.10.0
+matplotlib==3.8.4
+protobuf>=3.20.0
