@@ -11,6 +11,7 @@ class ProteinDrugDataset(Dataset):
     def __init__(self, h5_file, csv_subset, smiles_cache, tokenizer=None, max_len=25):
         self.data_df = csv_subset
         self.h5_file_path = h5_file
+        self.h5_file = None
         self.smiles_cache = smiles_cache
         self.tokenizer = tokenizer
         self.max_len = max_len
@@ -27,6 +28,11 @@ class ProteinDrugDataset(Dataset):
 
         print(f"Stage dataset loaded: {len(self.valid_indices)} valid entries from {os.path.basename(self.h5_file_path)}")
 
+    def _get_h5(self):
+        if self.h5_file is None:
+            self.h5_file = h5py.File(self.h5_file_path, 'r')
+        return self.h5_file
+
     def __len__(self):
         return len(self.valid_indices)
 
@@ -39,9 +45,8 @@ class ProteinDrugDataset(Dataset):
 
         interaction_phrase = self.extract_interaction_phrase(interaction)
 
-        # CHANGED: always load from a single HDF5 file path
-        with h5py.File(self.h5_file_path, 'r') as h5_file:
-            protein_embedding = torch.tensor(h5_file[f"genes_{gene_id}"][:]).float()
+        h5_file = self._get_h5()
+        protein_embedding = torch.tensor(h5_file[f"genes_{gene_id}"][:]).float()
 
         drug_graph = cache_to_pyg_data(self.smiles_cache[smiles])
 

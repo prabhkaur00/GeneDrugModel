@@ -4,13 +4,15 @@ from torch.cuda.amp import autocast
 from transformers import AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
 from gnn import GNN_graphpred
+import time
 
-class ProteinDrugLLMModelLoRA(torch.nn.Module):
+class ProteinDrugLLMModel(torch.nn.Module):
     def __init__(self,
                  tokenizer,
                  llm_model_name="/mnt/data/vicuna-13b-v1.5",
                  gnn_ckpt=None,
                  freeze_gnn=True,
+                 freeze_llm=True,
                  protein_hidden_dim=768,
                  lora_r=8,
                  lora_alpha=16,
@@ -18,33 +20,45 @@ class ProteinDrugLLMModelLoRA(torch.nn.Module):
 
         super().__init__()
         self.tokenizer = tokenizer
-        self.protein_token_id = self.tokenizer.convert_tokens_to_ids("[PROTEIN]")
-        self.drug_token_id = self.tokenizer.convert_tokens_to_ids("[DRUG]")
-        self.vocab_size = len(self.tokenizer)
+        self.protein_token_id = tokenizer.convert_tokens_to_ids("[PROTEIN]")
+        self.drug_token_id = tokenizer.convert_tokens_to_ids("[DRUG]")
+        print("PROTEIN token ID:", tokenizer.convert_tokens_to_ids("[PROTEIN]"))
+        print("DRUG token ID:", tokenizer.convert_tokens_to_ids("[DRUG]"))
+        self.vocab_size = len(tokenizer)
+        self.freeze_llm = freeze_llm
 
         self.gnn = self.create_gnn(gnn_ckpt, freeze_gnn)
         self.drug_hidden_dim = 300
         self.protein_hidden_dim = protein_hidden_dim
 
+        print("Loading LLM")
+        llm_start = time.time()
         base_llm = AutoModelForCausalLM.from_pretrained(
             llm_model_name,
             torch_dtype=torch.float16
         )
-        base_llm.resize_token_embeddings(len(self.tokenizer))
-        base_llm.gradient_checkpointing_enable()
-        base_llm.enable_input_require_grads()
+        base_llm.resize_token_embeddings(len(tokenizer))
+        print(f"LLM weights loaded in {time.time() - llm_start:.2f} seconds")
 
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=["q_proj", "v_proj"],
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM
-        )
-        self.llm = get_peft_model(base_llm, lora_config)
+        if freeze_llm:
+            for param in base_llm.parameters():
+                param.requires_grad = False
+            base_llm.eval()
+            self.llm = base_llm
+        else:
+            base_llm.gradient_checkpointing_enable()
+            base_llm.enable_input_require_grads()
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=["q_proj", "v_proj"],
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM
+            )
+            self.llm = get_peft_model(base_llm, lora_config)
+
         self.llm_hidden_size = self.llm.config.hidden_size
-
         self.protein_proj = nn.Sequential(
             nn.Linear(self.protein_hidden_dim, self.llm_hidden_size),
             nn.LayerNorm(self.llm_hidden_size, eps=1e-5)
@@ -54,7 +68,10 @@ class ProteinDrugLLMModelLoRA(torch.nn.Module):
             nn.LayerNorm(self.llm_hidden_size, eps=1e-5)
         )
 
+        self.print_trainable_parameters()
+
     def create_gnn(self, model_path, freeze):
+        from gnn import GNN_graphpred
         emb_dim = 300
         gnn = GNN_graphpred(5, emb_dim, emb_dim, graph_pooling='attention', gnn_type='gcn')
         if model_path:
@@ -64,6 +81,18 @@ class ProteinDrugLLMModelLoRA(torch.nn.Module):
                 param.requires_grad = False
             gnn.eval()
         return gnn
+
+    def print_trainable_parameters(self):
+        print("\n[Trainable Parameters]")
+        total = 0
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                print(f"- {name}: {param.numel()} params")
+                total += param.numel()
+        print(f"Total trainable parameters: {total}\n")
+
+    def get_embeddings_layer(self):
+        return self.llm.get_input_embeddings() if self.freeze_llm else self.llm.get_base_model().get_input_embeddings()
 
     def encode_drug(self, graph):
         device = next(self.parameters()).device
@@ -86,8 +115,6 @@ class ProteinDrugLLMModelLoRA(torch.nn.Module):
         drug_proj = self.drug_proj(drug_embeds)
         return protein_proj, drug_proj
 
-    def get_embeddings_layer(self):
-        return self.llm.get_base_model().get_input_embeddings()
 
     def forward(self, protein_data, drug_graph, target_text=None, max_len=25):
         with autocast():
@@ -149,3 +176,4 @@ class ProteinDrugLLMModelLoRA(torch.nn.Module):
                         no_repeat_ngram_size=2
                     )
                 return gen
+
