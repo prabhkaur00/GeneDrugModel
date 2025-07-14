@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from transformers import AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
 from gnn import GNN_graphpred
@@ -107,9 +107,9 @@ class ProteinDrugLLMModel(torch.nn.Module):
         protein_embeds = protein_embeds.to(device).to(torch.float16)
         drug_embeds = drug_embeds.to(device).to(torch.float16)
         if protein_embeds.ndim == 3:
-            protein_embeds = protein_embeds.max(dim=1).values
+            protein_embeds = protein_embeds.mean(dim=1).values
         if drug_embeds.ndim == 3:
-            drug_embeds = drug_embeds.max(dim=1).values
+            drug_embeds = drug_embeds.mean(dim=1).values
 
         protein_proj = self.protein_proj(protein_embeds)
         drug_proj = self.drug_proj(drug_embeds)
