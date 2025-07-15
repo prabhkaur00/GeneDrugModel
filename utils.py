@@ -2,6 +2,7 @@ import torch
 from torch_geometric.data import Data
 import gc
 from torch_geometric.data import Batch
+import numpy as np
 
 def cache_to_pyg_data(graph_dict):
     """Convert cached graph to PyG Data object"""
@@ -50,6 +51,8 @@ def collate_fn(batch):
     padded_proteins = []
     for item in batch:
         protein_emb = item['protein_embedding']
+        if isinstance(protein_emb, np.ndarray):
+            protein_emb = torch.from_numpy(protein_emb)
         current_len = protein_emb.shape[0]
 
         if current_len < max_protein_len:

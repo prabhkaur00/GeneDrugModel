@@ -28,6 +28,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--flag", type=str, choices=["local"], help="Use Google Drive paths if flag is 'local'")
 args = parser.parse_args()
 
+import torch.multiprocessing as mp
+
+mp.set_start_method("spawn", force=True)         # safer with h5py
+mp.set_sharing_strategy("file_system")           # avoid /dev/shm limit
 colab = args.flag == "local" 
 
 if colab:
@@ -36,15 +40,20 @@ if colab:
     smiles_cache_file = '/content/drive/MyDrive/Shared-with-booknerd/smiles_cache.pkl'
     model_name = 'meta-llama/Llama-2-7b-hf'
     gnn_ckpt = '/content/drive/MyDrive/Shared-with-booknerd/gcn_contextpred.pth'
+    graph_cache_file = '/content/drive/MyDrive/Shared-with-booknerd/graph_cache.pkl'
 else:
     h5_dir = '/mnt/data/gene_data'
     csv_file = '/mnt/data/tier1.csv'
     smiles_cache_file = '/mnt/data/smiles_cache.pkl'
+    graph_cache_file = '/mnt/data/graph_cache.pkl'
     model_name = '/mnt/data/vicuna-13b-v1.5'
     gnn_ckpt = '/mnt/data/gcn_contextpred.pth'
 
 print("Loading tokenizer")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+t0 = time.time(); print("Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, local_files_only=True)
+print(f"Tokenizer: {time.time()-t0:.1f}s")
+
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.add_special_tokens({"additional_special_tokens": ["[PROTEIN]", "[DRUG]"]})
@@ -52,8 +61,16 @@ print("Added special tokens")
 
 print("Loading full CSV and SMILES cache")
 full_csv_df = pd.read_csv(csv_file)
-with open(smiles_cache_file, 'rb') as f:
-    smiles_cache = pickle.load(f)
+import pickle, tqdm
+from utils import cache_to_pyg_data
+
+with open(smiles_cache_file, "rb") as f:
+    smiles_cache_raw = pickle.load(f)
+graph_cache = {}
+for k, raw in tqdm.tqdm(smiles_cache_raw.items(), desc="Building PyG graphs"):
+    graph_cache[k] = cache_to_pyg_data(raw)   # → torch_geometric.data.Data
+with open(graph_cache_file, "wb") as f:
+    pickle.dump(graph_cache, f)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -67,7 +84,7 @@ model = ProteinDrugLLMModel(
 print("Model created")
 
 h5_files = sorted([f for f in os.listdir(h5_dir) if f.endswith('.h5')])
-for epoch in range(1, 5):
+for epoch in range(1, 2):
     print(f"\n=== Epoch {epoch} ===")
     for h5_fname in h5_files:
         print(f"\n--- Training on stage: {h5_fname} ---")
@@ -82,7 +99,7 @@ for epoch in range(1, 5):
         for idx, row in full_csv_df.iterrows():
             gene_id = str(int(row['GeneID']))
             h5_key = f"genes_{gene_id}"
-            if h5_key in keys and row['SMILES'] in smiles_cache:
+            if h5_key in keys and row['SMILES'] in graph_cache:
                 relevant_rows.append(row)
         print(f"Filtered to {len(relevant_rows)} rows.")
 
@@ -91,7 +108,7 @@ for epoch in range(1, 5):
         dataset = ProteinDrugDataset(
             h5_file=h5_path,
             csv_subset=csv_subset,
-            smiles_cache=smiles_cache,
+            graph_cache=graph_cache,
             tokenizer=tokenizer
         )
 
@@ -107,10 +124,10 @@ for epoch in range(1, 5):
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             tokenizer=tokenizer,
-            batch_size=8,
+            batch_size=1,
             log_predictions=True,
             log_frequency=5,
-            num_epochs=5
+            num_epochs=1
         )
 
         ckpt_path = f"/mnt/data/checkpoints/model_epoch{epoch}_{h5_fname}.pt"

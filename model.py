@@ -31,15 +31,21 @@ class ProteinDrugLLMModel(torch.nn.Module):
         self.drug_hidden_dim = 300
         self.protein_hidden_dim = protein_hidden_dim
 
-        print("Loading LLM")
-        llm_start = time.time()
+        t0 = time.time(); print("Loading model+resizing tokenizer...")
+        t1 = time.time(); print("Loading model...")
         base_llm = AutoModelForCausalLM.from_pretrained(
             llm_model_name,
-            torch_dtype=torch.float16
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=False,    # faster; needs host RAM
+            local_files_only=True,
         )
+        print(f"Model load: {time.time()-t1:.1f}s")
+    
+        t2 = time.time(); print("Resizing token embeddings...")
         base_llm.resize_token_embeddings(len(tokenizer))
-        print(f"LLM weights loaded in {time.time() - llm_start:.2f} seconds")
+        print(f"Resize: {time.time()-t2:.1f}s")
 
+        print(f"TOTAL: {time.time()-t0:.1f}s")
         if freeze_llm:
             for param in base_llm.parameters():
                 param.requires_grad = False
@@ -104,12 +110,12 @@ class ProteinDrugLLMModel(torch.nn.Module):
 
     def process_embeddings(self, protein_embeds, drug_embeds):
         device = next(self.parameters()).device
-        protein_embeds = protein_embeds.to(device).to(torch.float16)
-        drug_embeds = drug_embeds.to(device).to(torch.float16)
+        protein_embeds = protein_embeds.to(device).to(torch.bfloat16)
+        drug_embeds = drug_embeds.to(device).to(torch.bfloat16)
         if protein_embeds.ndim == 3:
-            protein_embeds = protein_embeds.mean(dim=1).values
+            protein_embeds = protein_embeds.mean(dim=1)
         if drug_embeds.ndim == 3:
-            drug_embeds = drug_embeds.mean(dim=1).values
+            drug_embeds = drug_embeds.mean(dim=1)
 
         protein_proj = self.protein_proj(protein_embeds)
         drug_proj = self.drug_proj(drug_embeds)
@@ -117,7 +123,7 @@ class ProteinDrugLLMModel(torch.nn.Module):
 
 
     def forward(self, protein_data, drug_graph, target_text=None, max_len=25):
-        with autocast():
+        with autocast("cuda"):
             device = next(self.parameters()).device
             protein_data = protein_data.to(device)
             drug_graph = drug_graph.to(device)

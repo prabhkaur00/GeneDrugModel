@@ -6,7 +6,7 @@ def log_batch_predictions(model, batch, tokenizer, device, batch_idx, epoch):
     model.eval()
     try:
         with torch.no_grad():
-            protein_embeddings = batch['protein_embeddings'].to(device, dtype=torch.float16)
+            protein_embeddings = batch['protein_embeddings'].to(device, dtype=torch.bfloat16)
             drug_graphs = batch['drug_graphs'].to(device)
             target_text = batch['encoded_texts']
             try:

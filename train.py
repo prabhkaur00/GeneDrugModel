@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 from utils import print_gpu_memory, collate_fn
 from logger import log_batch_predictions
+import time
 
 def train_model(
     model,
@@ -45,7 +46,12 @@ def train_model(
 
     model.train()
     model = model.to(device)
-
+    if hasattr(model, "gradient_checkpointing_enable"):
+        print("[Enabling gradient checkpointing]")
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        print("[Enabling input require grads]")
+        model.enable_input_require_grads()
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -55,6 +61,22 @@ def train_model(
         pin_memory=True,
         drop_last=True,
     )
+    start = time.time()
+    for _ in range(100):
+        next(iter(train_loader))
+    print(f"[Profiler] Loader avg: {(time.time()-start)/100:.3f} s")
+
+    batch = next(iter(train_loader))
+    t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
+    t0.record()
+
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = model(batch['protein_embeddings'].to(device),
+                    batch['drug_graphs'].to(device),
+                    batch['encoded_texts'])
+    loss.backward()
+    t1.record(); torch.cuda.synchronize()
+    print(f"[Profiler] Step time: {t0.elapsed_time(t1)/1000:.3f} s")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     total_steps = len(train_loader) * num_epochs // grad_accum_steps
@@ -77,9 +99,9 @@ def train_model(
                 if target_text:
                     target_text = {k: v.to(device) for k, v in target_text.items()}
 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    loss = model(protein_data, drug_graph, target_text)
-                    loss = loss / grad_accum_steps
+                
+                loss = model(protein_data, drug_graph, target_text)
+                loss = loss / grad_accum_steps
                 
                 if not torch.isfinite(loss):
                     msg = f"[NaN detected] Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item()}"
@@ -100,6 +122,10 @@ def train_model(
                     avg_loss = total_loss / step_count if step_count > 0 else 0
                     with open(log_path, "a") as f:
                         f.write(f"{step_count},{epoch+1},{batch_idx+1},{avg_loss:.4f}\n")
+                
+                del protein_data, drug_graph, target_text
+                torch.cuda.empty_cache()
+                gc.collect()
 
                 total_loss += loss.item() * grad_accum_steps
                 step_count += 1
@@ -150,8 +176,6 @@ def train_model(
         print(f"[Epoch {epoch+1}] Finished. Avg loss: {avg_epoch_loss:.4f}")
         torch.cuda.empty_cache()
 
-        validate_model(model, val_dataset, tokenizer, device)
-
         final_ckpt = f"checkpoints/ckpt_epoch{epoch}_final_{stage_name}.pt"
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -164,6 +188,79 @@ def train_model(
 
     return model
 
+import torch
+from torch.utils.data import DataLoader
+from utils import collate_fn          # same collate you already have
+
+def decode(tokenizer, ids):
+    """Turn a tensor of token-ids into a clean string."""
+    txt = tokenizer.decode(ids, skip_special_tokens=True)
+    return txt.replace("[PROTEIN]", "").replace("[DRUG]", "").strip()
+
+@torch.no_grad()
+def print_predictions(model, batch, tokenizer, device, n=3):
+    # take first n items for display
+    prot  = batch["protein_embeddings"][:n].to(device)
+    graph = batch["drug_graphs"][:n].to(device)
+
+    # forward pass in eval mode
+    model.eval()
+    
+    generated_ids = model.generate(prot, graph, max_new_tokens=15)
+    model.train()
+
+    expected_ids = batch["encoded_texts"][:n]
+    for i in range(len(expected_ids)):
+        exp = decode(tokenizer, expected_ids[i].cpu())
+        pred = decode(tokenizer, generated_ids[i].cpu())
+        print(f"  · expected: «{exp}»")
+        print(f"    predicted: «{pred}»\n")
+
+def train_minimal(
+    model,
+    train_data,
+    tokenizer,
+    device=None,
+    batch_size=8,
+    epochs=1,
+    lr=1e-4,
+    show_every=5,
+    preview_k=3,
+):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    loader  = DataLoader(train_data,
+                         batch_size=batch_size,
+                         shuffle=True,
+                         collate_fn=collate_fn,
+                         num_workers=0,
+                         pin_memory=False)
+
+    optim   = torch.optim.AdamW(model.parameters(), lr=lr)
+    scaler  = torch.amp.GradScaler()
+
+    for epoch in range(epochs):
+        running = 0.0
+        for b, batch in enumerate(loader, 1):
+            optim.zero_grad()
+            loss = model(batch["protein_embeddings"].to(device),
+                            batch["drug_graphs"].to(device),
+                            batch["encoded_texts"])
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
+
+            running += loss.item()
+            print(f"epoch {epoch+1}  batch {b}  loss {loss.item():.4f}")
+
+            if b % show_every == 0:
+                print_predictions(model, batch, tokenizer, device, n=preview_k)
+
+        print(f"epoch {epoch+1} finished – avg loss {(running/len(loader)):.4f}")
+
+    torch.save(model.state_dict(), "model_min.pt")
+    print("✓ training complete")
 
 def validate_model(model, val_dataset, tokenizer, device):
     model.eval()

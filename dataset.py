@@ -6,18 +6,19 @@ import os
 import torch
 from torch_geometric.data import Batch
 from utils import cache_to_pyg_data
-
+import re
+drug_tag      = r"\[DRUG\]"
+protein_tag   = r"\[PROTEIN[^\]]*\]"   # also catches “protein mutant form”, etc.
 class ProteinDrugDataset(Dataset):
-    def __init__(self, h5_file, csv_subset, smiles_cache, tokenizer=None, max_len=25):
+    def __init__(self, h5_file, csv_subset, graph_cache, tokenizer=None, max_len=25):
         self.data_df = csv_subset
-        self.h5_file_path = h5_file
-        self.h5_file = None
-        self.smiles_cache = smiles_cache
+        self.h5_path = h5_file
+        self.smiles_cache = graph_cache
         self.tokenizer = tokenizer
         self.max_len = max_len
 
         self.valid_indices = []
-        with h5py.File(self.h5_file_path, 'r') as h5_file:
+        with h5py.File(self.h5_path, 'r') as h5_file:
             keys = set(h5_file.keys())
             for idx, row in self.data_df.iterrows():
                 gene_id = str(int(row['GeneID']))
@@ -26,12 +27,7 @@ class ProteinDrugDataset(Dataset):
                 if h5_key in keys and smiles in self.smiles_cache:
                     self.valid_indices.append(idx)
 
-        print(f"Stage dataset loaded: {len(self.valid_indices)} valid entries from {os.path.basename(self.h5_file_path)}")
-
-    def _get_h5(self):
-        if self.h5_file is None:
-            self.h5_file = h5py.File(self.h5_file_path, 'r')
-        return self.h5_file
+        print(f"Stage dataset loaded: {len(self.valid_indices)} valid entries from {os.path.basename(self.h5_path)}")
 
     def __len__(self):
         return len(self.valid_indices)
@@ -45,10 +41,10 @@ class ProteinDrugDataset(Dataset):
 
         interaction_phrase = self.extract_interaction_phrase(interaction)
 
-        h5_file = self._get_h5()
-        protein_embedding = torch.tensor(h5_file[f"genes_{gene_id}"][:]).float()
+        with h5py.File(self.h5_path, "r") as h5:
+            protein_embedding = h5[f"genes_{gene_id}"][()]   
 
-        drug_graph = cache_to_pyg_data(self.smiles_cache[smiles])
+        drug_graph = self.smiles_cache[smiles]
 
         if self.tokenizer and interaction_phrase:
             encoded_text = self.tokenizer(
@@ -71,43 +67,38 @@ class ProteinDrugDataset(Dataset):
             'smiles': smiles
         }
 
-    def extract_interaction_phrase(self, text):
-        try:
-            before, after_drug = text.split("[DRUG]", 1)
-            phrase, _ = after_drug.split("[PROTEIN]", 1)
-            return phrase.strip()
-        except Exception as e:
-            msg = f"[extract_interaction_phrase] Fallback used for: {text} | Error: {str(e)}"
-            print(msg)
-            with open("logs/error_log.txt", "a") as f: f.write(msg + "\n")
-            return "affects the expression"
+    def extract_interaction_phrase(self, text) -> str:
+        """
+        Returns the text sandwiched between the two entity tags,
+        no matter which order they appear in.  Falls back to an
+        empty string so the caller can decide what to do.
+        """
+        # [DRUG] … [PROTEIN]
+        m = re.search(fr"{drug_tag}(.*?){protein_tag}", text)
+        if m:
+            return m.group(1).strip()
+
+        # [PROTEIN] … [DRUG]
+        m = re.search(fr"{protein_tag}(.*?){drug_tag}", text)
+        if m:
+            return m.group(1).strip()
+
+        # If we get here the line is malformed; return sentinel
+        return ""
 
 def collate_fn(batch):
     """Fixed collate function with proper device handling"""
-    max_protein_len = max([item['protein_embedding'].shape[0] for item in batch])
-
-    padded_proteins = []
-    for item in batch:
-        protein_emb = item['protein_embedding']
-        current_len = protein_emb.shape[0]
-
-        if current_len < max_protein_len:
-            padding = torch.zeros(max_protein_len - current_len, protein_emb.shape[1], dtype=protein_emb.dtype)
-            padded_protein = torch.cat([protein_emb, padding], dim=0)
-        else:
-            padded_protein = protein_emb[:max_protein_len]
-        padded_proteins.append(padded_protein)
-
-    protein_embeddings = torch.stack(padded_proteins)
+    from torch.nn.utils.rnn import pad_sequence
+    protein_embeddings = pad_sequence(
+        [item['protein_embedding'] for item in batch],
+        batch_first=True
+    )
     drug_graphs = [item['drug_graph'] for item in batch]
     interactions = [item['interaction'] for item in batch]
     gene_ids = [item['gene_id'] for item in batch]
     smiles = [item['smiles'] for item in batch]
 
-    # Batch drug graphs
     batched_drugs = Batch.from_data_list(drug_graphs)
-
-    # Handle encoded texts
     encoded_texts = None
     if all(item['encoded_text'] is not None for item in batch):
         encoded_texts = {
