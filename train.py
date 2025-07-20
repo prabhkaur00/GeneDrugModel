@@ -98,7 +98,7 @@ def train_model(
     total_steps = len(train_loader) * num_epochs // grad_accum_steps
     warmup_steps = int(total_steps * warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler()
     for epoch in range(num_epochs):
         print(f"\n[Epoch {epoch+1}] Starting")
         print_gpu_memory()
