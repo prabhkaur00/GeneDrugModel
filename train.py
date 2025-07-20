@@ -2,12 +2,29 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
-import gc
+import gc, json
 import os
 from datetime import datetime
 from utils import print_gpu_memory, collate_fn
 from logger import log_batch_predictions
 import time
+
+def log_bad_batch(batch_idx, epoch, batch, loss, log_dir="/mnt/data/logs"):
+    os.makedirs(log_dir, exist_ok=True)
+    bad = {
+        "epoch": epoch,
+        "batch_idx": batch_idx,
+        "loss_shape": tuple(loss.shape),
+        "loss_nan": torch.isnan(loss).sum().item(),
+        "loss_inf": torch.isinf(loss).sum().item(),
+        "sample_ids": batch["sample_ids"],
+        "prot_lens": [p.shape[0] for p in batch["protein_embeddings"]],
+        "graph_nodes": [g.num_nodes for g in batch["drug_graphs"].to_data_list()],
+        "text_lens": batch["encoded_texts"]["input_ids"].shape[1]
+                     if batch["encoded_texts"] else None
+    }
+    with open(os.path.join(log_dir, "bad_batches.jsonl"), "a") as f:
+        f.write(json.dumps(bad) + "\n")
 
 def train_model(
     model,
@@ -69,11 +86,10 @@ def train_model(
     batch = next(iter(train_loader))
     t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
     t0.record()
-
-    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(batch['protein_embeddings'].to(device),
-                    batch['drug_graphs'].to(device),
-                    batch['encoded_texts'])
+    ## for profiling purposes, we run a single batch
+    loss = model(batch['protein_embeddings'].to(device),
+                batch['drug_graphs'].to(device),
+                batch['encoded_texts'])
     loss.backward()
     t1.record(); torch.cuda.synchronize()
     print(f"[Profiler] Step time: {t0.elapsed_time(t1)/1000:.3f} s")
@@ -82,7 +98,7 @@ def train_model(
     total_steps = len(train_loader) * num_epochs // grad_accum_steps
     warmup_steps = int(total_steps * warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler = torch.cuda.GradScaler()
+    scaler = torch.amp.GradScaler("cuda")
     for epoch in range(num_epochs):
         print(f"\n[Epoch {epoch+1}] Starting")
         print_gpu_memory()
@@ -101,15 +117,17 @@ def train_model(
 
                 
                 loss = model(protein_data, drug_graph, target_text)
-                loss = loss / grad_accum_steps
-                
-                if not torch.isfinite(loss):
-                    msg = f"[NaN detected] Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item()}"
+                if loss is None or loss.dim() != 0:
+                    msg = f"[BadLoss] epoch={epoch+1} batch={batch_idx} loss_shape={None if loss is None else tuple(loss.shape)}"
                     print(msg, flush=True)
                     with open(log_path, "a") as f:
                         f.write(msg + "\n")
-                    torch.cuda.empty_cache()
-                    torch.save(model.state_dict(), f"checkpoints/nan_model_epoch{epoch}_batch{batch_idx}.pt")
+                    log_bad_batch(epoch+1, batch_idx, batch, loss)
+                    continue
+                loss = loss / grad_accum_steps
+                
+                if not torch.isfinite(loss).item():
+                    log_bad_batch(epoch+1, batch_idx, batch, loss)                       # see step 6
                     continue
 
                 scaler.scale(loss).backward()

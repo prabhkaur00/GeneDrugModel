@@ -123,7 +123,7 @@ class ProteinDrugLLMModel(torch.nn.Module):
 
 
     def forward(self, protein_data, drug_graph, target_text=None, max_len=25):
-        with autocast("cuda"):
+        with autocast(device_type="cuda", dtype=torch.bfloat16):
             device = next(self.parameters()).device
             protein_data = protein_data.to(device)
             drug_graph = drug_graph.to(device)
