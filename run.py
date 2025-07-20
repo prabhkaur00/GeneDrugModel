@@ -124,7 +124,7 @@ for epoch in range(1, 2):
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             tokenizer=tokenizer,
-            batch_size=2,
+            batch_size=8,
             log_predictions=True,
             log_frequency=5,
             num_epochs=1
