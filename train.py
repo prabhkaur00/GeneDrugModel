@@ -75,7 +75,7 @@ def train_model(
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=3,
+        num_workers=1,
         persistent_workers=True,
         pin_memory=True,
         prefetch_factor=1,

@@ -46,7 +46,7 @@ def get_batch_size():
     print(f"Selected device {best_idx}: {name} ({mem_gb:.1f} GB)")
 
     if mem_gb > 60:
-        return 16
+        return 4
     elif mem_gb > 30:
         return 4
     
