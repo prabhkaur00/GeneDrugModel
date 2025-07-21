@@ -31,7 +31,6 @@ args = parser.parse_args()
 import torch.multiprocessing as mp
 
 mp.set_start_method("spawn", force=True)         # safer with h5py
-mp.set_sharing_strategy("file_system")           # avoid /dev/shm limit
 
 def get_batch_size():
     max_mem = 0
