@@ -42,7 +42,9 @@ def train_model(
     log_predictions=True,
     log_frequency=10,
     stage_name="",
-    checkpoint_interval=100
+    checkpoint_interval=100,
+    num_workers=1,
+    prefetch_factor=1
 ):
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -75,10 +77,10 @@ def train_model(
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=1,
+        num_workers=num_workers,
         persistent_workers=True,
         pin_memory=True,
-        prefetch_factor=1,
+        prefetch_factor=prefetch_factor,
         drop_last=True,
     )
 
