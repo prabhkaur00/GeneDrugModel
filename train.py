@@ -74,14 +74,31 @@ def train_model(
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=4,
+        persistent_workers=True,
         pin_memory=True,
+        prefetch_factor=2,
         drop_last=True,
     )
+
+    num_batches = len(train_loader)
+    print(f"[Info] Each epoch will have ~{num_batches} batches.")
+
+    # === Start RSS logging thread ===
+    import psutil, os, threading, time
+
+    def mem_watch():
+        p = psutil.Process(os.getpid())
+        while True:
+            rss_gb = p.memory_info().rss / (1024 ** 3)  # bytes → GiB
+            print(f"[MEM RSS] {rss_gb:.2f} GiB")
+            time.sleep(5)  # print every 5 seconds
+
+    threading.Thread(target=mem_watch, daemon=True).start()
     start = time.time()
     for _ in range(100):
         next(iter(train_loader))
-    print(f"[Profiler] Loader avg: {(time.time()-start)/100:.3f} s")
+    print(f"[Profiler] DataLoader avg: {(time.time()-start)/100:.3f} s")
 
     batch = next(iter(train_loader))
     t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
@@ -141,9 +158,6 @@ def train_model(
                     with open(log_path, "a") as f:
                         f.write(f"{step_count},{epoch+1},{batch_idx+1},{avg_loss:.4f}\n")
                 
-                del protein_data, drug_graph, target_text
-                torch.cuda.empty_cache()
-                gc.collect()
 
                 total_loss += loss.item() * grad_accum_steps
                 step_count += 1
