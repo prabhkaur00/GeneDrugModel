@@ -32,6 +32,25 @@ import torch.multiprocessing as mp
 
 mp.set_start_method("spawn", force=True)         # safer with h5py
 mp.set_sharing_strategy("file_system")           # avoid /dev/shm limit
+
+def get_batch_size():
+    max_mem = 0
+    best_idx = 0
+    for i in range(torch.cuda.device_count()):
+        mem = torch.cuda.get_device_properties(i).total_memory
+        if mem > max_mem:
+            max_mem = mem
+            best_idx = i
+
+    mem_gb = max_mem / 1024**3
+    name = torch.cuda.get_device_name(best_idx)
+    print(f"Selected device {best_idx}: {name} ({mem_gb:.1f} GB)")
+
+    if mem_gb > 60:
+        return 16
+    elif mem_gb > 30:
+        return 4
+    
 colab = args.flag == "local" 
 
 if colab:
@@ -124,7 +143,7 @@ for epoch in range(1, 2):
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             tokenizer=tokenizer,
-            batch_size=8,
+            batch_size=get_batch_size(),
             log_predictions=True,
             log_frequency=5,
             num_epochs=1
