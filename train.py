@@ -8,6 +8,7 @@ from datetime import datetime
 from utils import print_gpu_memory, collate_fn
 from logger import log_batch_predictions
 import time
+import psutil, threading
 
 def log_bad_batch(batch_idx, epoch, batch, loss, log_dir="/mnt/data/logs"):
     os.makedirs(log_dir, exist_ok=True)
@@ -83,9 +84,6 @@ def train_model(
 
     num_batches = len(train_loader)
     print(f"[Info] Each epoch will have ~{num_batches} batches.")
-
-    # === Start RSS logging thread ===
-    import psutil, os, threading, time
 
     def mem_watch():
         p = psutil.Process(os.getpid())
