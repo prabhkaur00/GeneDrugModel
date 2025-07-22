@@ -10,20 +10,27 @@ from logger import log_batch_predictions
 import time
 import psutil, threading
 
-def log_bad_batch(batch_idx, epoch, batch, loss, log_dir="/mnt/data/logs"):
+def log_bad_batch(epoch, batch_idx, batch, loss, log_dir="/mnt/data/logs"):
     os.makedirs(log_dir, exist_ok=True)
+    prot_lens = list(batch['protein_embeddings'].shape)
+    graph_nodes = [g.num_nodes for g in batch['drug_graphs'].to_data_list()]
+    text_lens = None
+    if batch['encoded_texts'] is not None:
+        text_lens = batch['encoded_texts']['input_ids'].shape[1]
+
     bad = {
         "epoch": epoch,
         "batch_idx": batch_idx,
         "loss_shape": tuple(loss.shape),
         "loss_nan": torch.isnan(loss).sum().item(),
         "loss_inf": torch.isinf(loss).sum().item(),
-        "sample_ids": batch["sample_ids"],
-        "prot_lens": [p.shape[0] for p in batch["protein_embeddings"]],
-        "graph_nodes": [g.num_nodes for g in batch["drug_graphs"].to_data_list()],
-        "text_lens": batch["encoded_texts"]["input_ids"].shape[1]
-                     if batch["encoded_texts"] else None
+        "gene_ids": batch['gene_ids'],
+        "smiles": batch['smiles'],
+        "prot_batch_shape": prot_lens,   # e.g. (B, L, D)
+        "graph_nodes": graph_nodes,      # list of node counts
+        "text_seq_len": text_lens        # single int or None
     }
+
     with open(os.path.join(log_dir, "bad_batches.jsonl"), "a") as f:
         f.write(json.dumps(bad) + "\n")
 

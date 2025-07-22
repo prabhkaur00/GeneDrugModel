@@ -145,6 +145,7 @@ def main():
 
 if __name__ == "__main__":
     spawn_flag = bool(int(os.getenv("SPAWN", "0")))
+    print("Spawn flag: ${spawn_flag}")
     if (spawn_flag):
         import torch.multiprocessing as mp
         mp.freeze_support()
