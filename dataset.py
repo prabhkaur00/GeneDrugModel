@@ -1,34 +1,43 @@
 from torch.utils.data import Dataset
 import pandas as pd
-import h5py
 import pickle
 import os
 import torch
 from torch_geometric.data import Batch
 from utils import cache_to_pyg_data
 import re
+import lmdb
+import numpy as np
+import io
 drug_tag      = r"\[DRUG\]"
 protein_tag   = r"\[PROTEIN[^\]]*\]"   # also catches “protein mutant form”, etc.
 class ProteinDrugDataset(Dataset):
-    def __init__(self, h5_file, csv_subset, graph_cache, tokenizer=None, max_len=25):
+    def __init__(self, lmdb_path, csv_subset, graph_cache, tokenizer=None, max_len=25):
         self.data_df = csv_subset
-        self.h5_path = h5_file
+        self.lmdb_path = lmdb_path
+        self._env = None  # Will be lazily opened per worker
         self.smiles_cache = graph_cache
         self.tokenizer = tokenizer
         self.max_len = max_len
-
+        env = lmdb.open(lmdb_path, readonly=True, lock=False, subdir=False)
+        with env.begin() as txn:
+            keys = {k.decode("utf-8") for k, _ in txn.cursor()}
+        env.close()
         self.valid_indices = []
-        with h5py.File(self.h5_path, 'r') as h5_file:
-            keys = set(h5_file.keys())
-            for idx, row in self.data_df.iterrows():
-                gene_id = str(int(row['GeneID']))
-                smiles = row['SMILES']
-                h5_key = f"genes_{gene_id}"
-                if h5_key in keys and smiles in self.smiles_cache:
-                    self.valid_indices.append(idx)
+        for idx, row in self.data_df.iterrows():
+            gene_id = str(int(row['GeneID']))
+            smiles = row['SMILES']
+            if gene_id in keys and smiles in self.smiles_cache:
+                self.valid_indices.append(idx)
 
-        print(f"Stage dataset loaded: {len(self.valid_indices)} valid entries from {os.path.basename(self.h5_path)}")
+        print(f"Stage dataset loaded: {len(self.valid_indices)} valid entries out of {len(self.data_df)}")
 
+    def _lazy_env(self):
+        """Open LMDB env once per worker process."""
+        if self._env is None:
+            self._env = lmdb.open(self.lmdb_path, readonly=True, lock=False, subdir=False)
+        return self._env
+    
     def __len__(self):
         return len(self.valid_indices)
 
@@ -41,8 +50,10 @@ class ProteinDrugDataset(Dataset):
 
         interaction_phrase = self.extract_interaction_phrase(interaction)
 
-        with h5py.File(self.h5_path, "r") as h5:
-            protein_embedding = h5[f"genes_{gene_id}"][()]   
+        with self._lazy_env().begin() as txn:
+            emb_bytes = txn.get(gene_id.encode("utf-8"))
+            protein_embedding = np.load(io.BytesIO(emb_bytes))
+            protein_embedding = torch.tensor(protein_embedding, dtype=torch.float32)
 
         drug_graph = self.smiles_cache[smiles]
 

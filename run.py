@@ -46,7 +46,7 @@ def main():
         gnn_ckpt = '/content/drive/MyDrive/Shared-with-booknerd/gcn_contextpred.pth'
         graph_cache_file = '/content/drive/MyDrive/Shared-with-booknerd/graph_cache.pkl'
     else:
-        h5_dir = '/mnt/data/gene_data'
+        lmdb_path = '/mnt/data/gene_data/pooled_embeddings.lmdb'
         csv_file = '/mnt/data/tier1.csv'
         smiles_cache_file = '/mnt/data/smiles_cache.pkl'
         graph_cache_file = '/mnt/data/graph_cache.pkl'
@@ -87,61 +87,40 @@ def main():
 
     print("Model created")
 
-    h5_files = sorted([f for f in os.listdir(h5_dir) if f.endswith('.h5')])
     for epoch in range(1, 2):
         print(f"\n=== Epoch {epoch} ===")
-        for h5_fname in h5_files:
-            print(f"\n--- Training on stage: {h5_fname} ---")
-            stage_start = time.time()
-            h5_path = os.path.join(h5_dir, h5_fname)
-            print("Loading H5 keys...")
-            with h5py.File(h5_path, 'r') as h5_file:
-                keys = set(h5_file.keys())
 
-            print("Filtering CSV rows...")
-            relevant_rows = []
-            for idx, row in full_csv_df.iterrows():
-                gene_id = str(int(row['GeneID']))
-                h5_key = f"genes_{gene_id}"
-                if h5_key in keys and row['SMILES'] in graph_cache:
-                    relevant_rows.append(row)
-            print(f"Filtered to {len(relevant_rows)} rows.")
+        print("Loading LMDB keys and filtering CSV...")
+        dataset = ProteinDrugDataset(
+            lmdb_path=lmdb_path,
+            csv_subset=full_csv_df,
+            graph_cache=graph_cache,
+            tokenizer=tokenizer
+        )
 
-            print("Building dataset...")
-            csv_subset = pd.DataFrame(relevant_rows).reset_index(drop=True)
-            dataset = ProteinDrugDataset(
-                h5_file=h5_path,
-                csv_subset=csv_subset,
-                graph_cache=graph_cache,
-                tokenizer=tokenizer
-            )
+        print("Splitting data...")
+        indices = list(range(len(dataset)))
+        train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=epoch)
+        train_dataset = torch.utils.data.Subset(dataset, train_idx)
+        val_dataset = torch.utils.data.Subset(dataset, val_idx)
 
-            print("Splitting data...")
-            indices = list(range(len(dataset)))
-            train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=epoch)
-            train_dataset = torch.utils.data.Subset(dataset, train_idx)
-            val_dataset = torch.utils.data.Subset(dataset, val_idx)
+        print("Training model...")
+        trained_model = train_model(
+            model=model,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            log_predictions=True,
+            log_frequency=5,
+            num_epochs=1,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor
+        )
 
-            print("Training model...")
-            trained_model = train_model(
-                model=model,
-                train_dataset=train_dataset,
-                val_dataset=val_dataset,
-                tokenizer=tokenizer,
-                batch_size=batch_size,
-                log_predictions=True,
-                log_frequency=5,
-                num_epochs=1,
-                num_workers=num_workers,
-                prefetch_factor=prefetch_factor
-            )
-
-            ckpt_path = f"/mnt/data/checkpoints/model_epoch{epoch}_{h5_fname}.pt"
-            print(f"Saving checkpoint to {ckpt_path}...")
-            torch.save(model.state_dict(), ckpt_path)
-
-            print(f"Stage {h5_fname} done in {time.time() - stage_start:.2f}s")
-
+        ckpt_path = f"/mnt/data/checkpoints/model_epoch{epoch}.pt"
+        print(f"Saving checkpoint to {ckpt_path}...")
+        torch.save(model.state_dict(), ckpt_path)
 
 if __name__ == "__main__":
     spawn_flag = bool(int(os.getenv("SPAWN", "0")))
