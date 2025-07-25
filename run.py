@@ -46,7 +46,7 @@ def main():
         gnn_ckpt = '/content/drive/MyDrive/Shared-with-booknerd/gcn_contextpred.pth'
         graph_cache_file = '/content/drive/MyDrive/Shared-with-booknerd/graph_cache.pkl'
     else:
-        lmdb_path = '/mnt/data/gene_data/pooled_embeddings.lmdb'
+        lmdb_path = '/mnt/data/gene_data/lmdb_parts/pooled_embeddings_0.h5.lmdb'
         csv_file = '/mnt/data/tier1.csv'
         smiles_cache_file = '/mnt/data/smiles_cache.pkl'
         graph_cache_file = '/mnt/data/graph_cache.pkl'
