@@ -5,6 +5,7 @@ from transformers import AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
 from gnn import GNN_graphpred
 import time
+import torch.nn.functional as F
 
 class ProteinDrugLLMModel(torch.nn.Module):
     def __init__(self,
@@ -113,12 +114,25 @@ class ProteinDrugLLMModel(torch.nn.Module):
         protein_embeds = protein_embeds.to(device).to(torch.bfloat16)
         drug_embeds = drug_embeds.to(device).to(torch.bfloat16)
         if protein_embeds.ndim == 3:
+            print("[PKW] Warning: protein_embeds has 3D shape, mean pooling will be applied")
             protein_embeds = protein_embeds.mean(dim=1)
         if drug_embeds.ndim == 3:
+            print("[PKW] Warning: drug_embeds has 3D shape, mean pooling will be applied")
             drug_embeds = drug_embeds.mean(dim=1)
 
         protein_proj = self.protein_proj(protein_embeds)
         drug_proj = self.drug_proj(drug_embeds)
+        protein_proj_before = protein_proj.clone().detach()
+        drug_proj_before    = drug_proj.clone().detach()
+        with torch.no_grad():
+            ref_std = self.get_embeddings_layer().weight.std().item()
+
+        protein_proj = F.layer_norm(protein_proj, protein_proj.shape[-1:]) * ref_std
+        drug_proj    = F.layer_norm(drug_proj,    drug_proj.shape[-1:])    * ref_std
+        print(f"[ScaleMatch] prot std {protein_proj_before.std():.4e}→{protein_proj.std():.4e}, "
+            f"drug std {drug_proj_before.std():.4e}→{drug_proj.std():.4e}, "
+            f"ref std {ref_std:.4e}")
+
         return protein_proj, drug_proj
 
 
