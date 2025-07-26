@@ -48,6 +48,42 @@ def eval_loss(model, loader, device):
     return tot / max(n, 1)
 
 
+# --- Debug helpers -----------------------------------------------------------
+def log_grad_stats(model, step, max_lines=10):
+    lines = []
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            g = p.grad
+            if g is None:
+                lines.append(f"[GRAD] step={step} {n}: None")
+            else:
+                gm = g.abs().mean().item()
+                gl = g.abs().max().item()
+                lines.append(f"[GRAD] step={step} {n}: mean={gm:.3e} max={gl:.3e}")
+            if len(lines) >= max_lines:
+                break
+    return "\n".join(lines)
+
+def count_supervised_tokens(tokenizer, target_text):
+    if not target_text:
+        return 0, 0
+    pad_id = tokenizer.pad_token_id
+    ids = target_text["input_ids"]
+    mask = (ids != pad_id)
+    return mask.sum().item(), ids.numel()
+
+def log_first_batch_shapes(batch, tokenizer, step_tag="[FIRST_BATCH]"):
+    msg = []
+    msg.append(f"{step_tag} protein_embeddings: {tuple(batch['protein_embeddings'].shape)}")
+    if hasattr(batch['drug_graphs'], 'to_data_list'):
+        msg.append(f"{step_tag} drug_graphs count: {len(batch['drug_graphs'].to_data_list())}")
+    if batch['encoded_texts'] is not None:
+        msg.append(f"{step_tag} encoded_texts ids: {tuple(batch['encoded_texts']['input_ids'].shape)} "
+                   f"mask: {tuple(batch['encoded_texts']['attention_mask'].shape)} "
+                   f"pad_id={tokenizer.pad_token_id}")
+    return "\n".join(msg)
+# ----------------------------------------------------------------------------- 
+
 def train_model(
     model,
     train_dataset,
@@ -106,13 +142,19 @@ def train_model(
     )
     print(f"[Info] Each epoch will have ~{len(train_loader)} batches.")
 
+    first_batch = next(iter(train_loader))
+    print(log_first_batch_shapes(first_batch, tokenizer))
+
+    sup, tot = count_supervised_tokens(tokenizer, first_batch['encoded_texts'])
+    print(f"[FIRST_BATCH] supervised_tokens={sup} / {tot}")
+    del first_batch
     # mem watch
-    def mem_watch():
-        p = psutil.Process(os.getpid())
-        while True:
-            print(f"[MEM RSS] {p.memory_info().rss / (1024**3):.2f} GiB")
-            time.sleep(600)
-    threading.Thread(target=mem_watch, daemon=True).start()
+    # def mem_watch():
+    #     p = psutil.Process(os.getpid())
+    #     while True:
+    #         print(f"[MEM RSS] {p.memory_info().rss / (1024**3):.2f} GiB")
+    #         time.sleep(600)
+    # threading.Thread(target=mem_watch, daemon=True).start()
 
     # quick loader/step profile
     start = time.time()
@@ -135,6 +177,7 @@ def train_model(
     warmup_steps = int(total_steps * warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     scaler = torch.amp.GradScaler()
+    print(f"[AMP] Initial scaler scale: {scaler.get_scale()}")
 
     # ckpt helpers
     LAST_CKPT = os.path.join(CKPT_DIR, "last.ckpt")
@@ -183,13 +226,22 @@ def train_model(
                     log_bad_batch(epoch+1, batch_idx, batch, loss)
                     continue
 
+                if (batch_idx == 0 and epoch == 0) or (batch_idx % 1000 == 0):
+                    sup, tot = count_supervised_tokens(tokenizer, batch['encoded_texts'])
+                    print(f"[TokSup] epoch={epoch+1} batch={batch_idx} supervised={sup}/{tot}")
                 scaler.scale(loss).backward()
-
+                
                 if (batch_idx + 1) % grad_accum_steps == 0:
+                    if step_count < 5:  # only print first 5 to avoid spam
+                        grad_msg = log_grad_stats(model, step_count)
+                        print(grad_msg)
+                        with open(log_path, "a") as f:
+                            f.write(grad_msg + "\n")
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                     scheduler.step()
+                    print(f"[AMP] step={step_count} scale={scaler.get_scale():.1f}")
                     avg_loss = total_loss / step_count if step_count > 0 else 0
                     with open(log_path, "a") as f:
                         f.write(f"{step_count},{epoch+1},{batch_idx+1},{avg_loss:.4f}\n")
@@ -228,6 +280,7 @@ def train_model(
 
         avg_epoch_loss = total_loss / step_count if step_count > 0 else 0
         print(f"[Epoch {epoch+1}] Finished. Avg loss: {avg_epoch_loss:.4f}")
+        print(f"[Epoch {epoch+1}] Val loss logged above. Best so far? {best_val:.4f}")
         torch.cuda.empty_cache()
 
         # ---- validation + save last/best ----
