@@ -18,7 +18,7 @@ LR = 1e-4
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SEG_DF_PATH = "/mnt/data/tier1_labeled.csv"
+SEG_DF_PATH = "/mnt/data/segments_2head.csv"
 VOCAB_PATH  = "/mnt/data/vocab.json"
 LMDB_PATH   = '/mnt/data/gene_data/lmdb_parts/pooled_embeddings_0.h5.lmdb'
 DRUG_CACHE  = '/mnt/data/smiles_cache.pkl'
