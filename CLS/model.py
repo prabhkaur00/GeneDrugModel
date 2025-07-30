@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch_geometric.data import Batch
 import datetime
+from gnn import GNN_graphpred  # your GNN class
 
 LOG_FILE = "/mnt/data/logs.txt"
 
@@ -13,6 +14,19 @@ def log(msg):
     with open(LOG_FILE, "a") as f:
         f.write(full_msg + "\n")
 
+def cache_to_pyg_data(graph_dict):
+    edge_index = torch.tensor(graph_dict['edge_index'], dtype=torch.long)
+    edge_feat = torch.tensor(graph_dict['edge_feat'], dtype=torch.long)
+    node_feat = torch.tensor(graph_dict['node_feat'], dtype=torch.long)
+    num_nodes = graph_dict['num_nodes']
+
+    data = torch_geometric.data.Data(
+        x=node_feat,
+        edge_index=edge_index,
+        edge_attr=edge_feat,
+        num_nodes=num_nodes
+    )
+    return data
 
 class CrossAttnBlock(nn.Module):
     def __init__(self, d, nheads=4, ff=4):
@@ -22,8 +36,8 @@ class CrossAttnBlock(nn.Module):
         self.ff = nn.Sequential(nn.Linear(d, ff*d), nn.GELU(), nn.Linear(ff*d, d))
         self.ln1 = nn.LayerNorm(d); self.ln2 = nn.LayerNorm(d); self.ln3 = nn.LayerNorm(d)
 
-    def forward(self, p, d):                    # p,d: (B,1,D)
-        x = torch.cat([p,d], dim=1)             # (B,2,D)
+    def forward(self, p, d):
+        x = torch.cat([p,d], dim=1)
         x = self.ln1(x + self.sa(x,x,x,need_weights=False)[0])
         p2 = self.ca(p, d, d, need_weights=False)[0]
         d2 = self.ca(d, p, p, need_weights=False)[0]
@@ -40,7 +54,7 @@ class BilinearGate(nn.Module):
         self.Wb = nn.Parameter(torch.empty(d, d)); nn.init.xavier_uniform_(self.Wb)
         self.gp = nn.Linear(d, d); self.gd = nn.Linear(d, d)
 
-    def forward(self, p, d):  # (B,1,D)
+    def forward(self, p, d):
         p, d = p.squeeze(1), d.squeeze(1)
         bil = torch.einsum("bd,dk,bk->bd", p, self.Wb, d)
         gp = torch.sigmoid(self.gp(d))
@@ -52,10 +66,12 @@ class BilinearGate(nn.Module):
         return fuse
 
 class TwoHeadConditional(nn.Module):
-    def __init__(self, dim_p=768, dim_d=300, d_model=512, n_targets=10, n_dirs=3):
+    def __init__(self, dim_p=768, emb_dim=300, d_model=512, n_targets=10, n_dirs=3,
+                 gnn_ckpt=None, freeze_gnn=True):
         super().__init__()
+        self.gnn = self.create_gnn(gnn_ckpt, freeze_gnn)
         self.pproj = nn.Linear(dim_p, d_model)
-        self.dproj = nn.Linear(dim_d, d_model)
+        self.dproj = nn.Linear(emb_dim, d_model)
         self.xblk  = CrossAttnBlock(d_model, nheads=4, ff=4)
         self.bgate = BilinearGate(d_model)
         fuse_dim   = d_model*4 + d_model
@@ -65,22 +81,37 @@ class TwoHeadConditional(nn.Module):
         self.target_emb = nn.Embedding(n_targets, 64)
         self.head_d = nn.Linear(512+64, n_dirs)
 
-    def forward(self, p_vec, d_vec):
-        log(f"[FWD] input p_vec: {p_vec.shape}, d_vec: {d_vec.shape}")
-        p = self.pproj(p_vec).unsqueeze(1)    # (B,1,512)
-        d = self.dproj(d_vec).unsqueeze(1)    # (B,1,512)
+    def create_gnn(self, model_path, freeze):
+        gnn = GNN_graphpred(num_layer=5, emb_dim=300, num_tasks=1, graph_pooling='attention', gnn_type='gcn')
+        if model_path:
+            gnn.from_pretrained(model_path)
+        if freeze:
+            for param in gnn.parameters():
+                param.requires_grad = False
+            gnn.eval()
+        return gnn
+
+    def forward(self, p_vec, graph_batch_dicts):
+        log(f"[FWD] input p_vec: {p_vec.shape}, num graphs: {len(graph_batch_dicts)}")
+
+        pyg_graphs = [cache_to_pyg_data(g) for g in graph_batch_dicts]
+        batch = Batch.from_data_list(pyg_graphs).to(p_vec.device)
+        d_vec = self.gnn(batch)  # (B, 300)
+        log(f"[GNN] d_vec: {d_vec.shape}")
+
+        p = self.pproj(p_vec).unsqueeze(1)
+        d = self.dproj(d_vec).unsqueeze(1)
         log(f"[PROJ] p_proj: {p.shape}, d_proj: {d.shape}")
 
-        p, d = self.xblk(p, d)                # Cross-attn block
-        fuse = self.bgate(p, d)               # Bilinear + gates
+        p, d = self.xblk(p, d)
+        fuse = self.bgate(p, d)
 
-        h = self.trunk(fuse)                  # (B, 512)
-        logit_t = self.head_t(h)              # (B, n_targets)
-        soft_t  = F.softmax(logit_t, dim=-1)
-        t_ctx   = torch.matmul(soft_t, self.target_emb.weight)  # (B, 64)
-
+        h = self.trunk(fuse)
+        logit_t = self.head_t(h)
+        soft_t = F.softmax(logit_t, dim=-1)
+        t_ctx = torch.matmul(soft_t, self.target_emb.weight)
         log(f"[HEAD_T] logit_t: {logit_t.shape}, soft_t: {soft_t.shape}")
-        logit_d = self.head_d(torch.cat([h, t_ctx], dim=-1))    # (B, n_dirs)
-        log(f"[HEAD_D] logit_d: {logit_d.shape}")
 
+        logit_d = self.head_d(torch.cat([h, t_ctx], dim=-1))
+        log(f"[HEAD_D] logit_d: {logit_d.shape}")
         return logit_t, logit_d
