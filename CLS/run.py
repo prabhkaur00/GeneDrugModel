@@ -84,7 +84,7 @@ val_loader = DataLoader(val_set, batch_size=BATCH_SIZE,
 
 # -------------------- MODEL --------------------
 model = TwoHeadConditional(
-    dim_p=768, dim_d=300,
+    dim_p=768, emb_dim=300,
     d_model=512,
     n_targets=NUM_T,
     n_dirs=NUM_D
