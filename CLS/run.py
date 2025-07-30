@@ -52,7 +52,6 @@ def log(msg):
     print(full_msg)
     with open(LOG_FILE, "a") as f:
         f.write(full_msg + "\n")
-# ------------------------------------------------
 
 # -------------------- LOAD DATA --------------------
 seg_df = pd.read_csv(SEG_DF_PATH)
