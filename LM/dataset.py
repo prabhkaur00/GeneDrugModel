@@ -32,14 +32,15 @@ class ProteinDrugDataset(Dataset):
 
         print(f"Stage dataset loaded: {len(self.valid_indices)} valid entries out of {len(self.data_df)}")
 
+    
+    def __len__(self):
+        return len(self.valid_indices)
+    
     def _lazy_env(self):
         """Open LMDB env once per worker process."""
         if self._env is None:
             self._env = lmdb.open(self.lmdb_path, readonly=True, lock=False, subdir=False)
         return self._env
-    
-    def __len__(self):
-        return len(self.valid_indices)
 
     def __getitem__(self, idx):
         df_idx = self.valid_indices[idx]

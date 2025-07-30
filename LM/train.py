@@ -280,7 +280,6 @@ def train_model(
 
         avg_epoch_loss = total_loss / step_count if step_count > 0 else 0
         print(f"[Epoch {epoch+1}] Finished. Avg loss: {avg_epoch_loss:.4f}")
-        print(f"[Epoch {epoch+1}] Val loss logged above. Best so far? {best_val:.4f}")
         torch.cuda.empty_cache()
 
         # ---- validation + save last/best ----
