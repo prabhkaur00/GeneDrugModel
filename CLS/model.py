@@ -5,7 +5,7 @@ from torch_geometric.data import Batch
 import datetime
 from gnn import GNN_graphpred  # your GNN class
 
-LOG_FILE = "/mnt/data/logs.txt"
+LOG_FILE = "/content/logs.txt"
 
 def log(msg):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -45,7 +45,6 @@ class CrossAttnBlock(nn.Module):
         x = self.ln2(x + x2)
         x = self.ln3(x + self.ff(x))
         p_out, d_out = x[:,0:1], x[:,1:2]
-        log(f"[XATTN] p_out: {p_out.shape}, d_out: {d_out.shape}")
         return p_out, d_out
 
 class BilinearGate(nn.Module):
@@ -62,7 +61,6 @@ class BilinearGate(nn.Module):
         p_g = p * gp
         d_g = d * gd
         fuse = torch.cat([p_g, d_g, p*d, torch.abs(p-d), bil], dim=-1)
-        log(f"[BILINEAR] fuse shape: {fuse.shape}")
         return fuse
 
 class TwoHeadConditional(nn.Module):
@@ -82,7 +80,8 @@ class TwoHeadConditional(nn.Module):
         self.head_d = nn.Linear(512+64, n_dirs)
 
     def create_gnn(self, model_path, freeze):
-        gnn = GNN_graphpred(num_layer=5, emb_dim=300, num_tasks=1, graph_pooling='attention', gnn_type='gcn')
+        emb_dim = 300
+        gnn = GNN_graphpred(5, emb_dim, emb_dim, graph_pooling='attention', gnn_type='gcn')
         if model_path:
             gnn.from_pretrained(model_path)
         if freeze:
@@ -91,17 +90,12 @@ class TwoHeadConditional(nn.Module):
             gnn.eval()
         return gnn
 
-    def forward(self, p_vec, graph_batch_dicts):
-        log(f"[FWD] input p_vec: {p_vec.shape}, num graphs: {len(graph_batch_dicts)}")
-
-        pyg_graphs = [cache_to_pyg_data(g) for g in graph_batch_dicts]
-        batch = Batch.from_data_list(pyg_graphs).to(p_vec.device)
-        d_vec = self.gnn(batch)  # (B, 300)
-        log(f"[GNN] d_vec: {d_vec.shape}")
+    def forward(self, p_vec, batch_data):
+        batch_data = batch_data.to(p_vec.device)
+        d_vec = self.gnn(batch_data)
 
         p = self.pproj(p_vec).unsqueeze(1)
         d = self.dproj(d_vec).unsqueeze(1)
-        log(f"[PROJ] p_proj: {p.shape}, d_proj: {d.shape}")
 
         p, d = self.xblk(p, d)
         fuse = self.bgate(p, d)
@@ -110,8 +104,6 @@ class TwoHeadConditional(nn.Module):
         logit_t = self.head_t(h)
         soft_t = F.softmax(logit_t, dim=-1)
         t_ctx = torch.matmul(soft_t, self.target_emb.weight)
-        log(f"[HEAD_T] logit_t: {logit_t.shape}, soft_t: {soft_t.shape}")
-
         logit_d = self.head_d(torch.cat([h, t_ctx], dim=-1))
-        log(f"[HEAD_D] logit_d: {logit_d.shape}")
+
         return logit_t, logit_d

@@ -18,10 +18,11 @@ LR = 1e-4
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SEG_DF_PATH = "/mnt/data/segments_2head.csv"
-VOCAB_PATH  = "/mnt/data/vocab.json"
-LMDB_PATH   = '/mnt/data/gene_data/lmdb_parts/pooled_embeddings_0.h5.lmdb'
-DRUG_CACHE  = '/mnt/data/smiles_cache.pkl'
+SEG_DF_PATH = "/content/drive/MyDrive/GeneDrugChat-Data/analysis_outputs/segments_2head.csv"
+VOCAB_PATH  = "/content/drive/MyDrive/GeneDrugChat-Data/analysis_outputs/vocab_2head.json"
+LMDB_PATH   = '/content/local_lmdb'
+DRUG_CACHE  = '/content/drive/MyDrive/GeneDrugChat-Data/smiles_cache.pkl'
+gnn_ckpt = '/content/drive/MyDrive/GeneDrugChat-Data/gcn_contextpred.pth'
 
 def cache_to_pyg_data(graph_dict):
     """Convert cached graph to PyG Data object"""
@@ -44,7 +45,7 @@ graph_cache = {}
 for k, raw in tqdm.tqdm(smiles_cache_raw.items(), desc="Building PyG graphs"):
     graph_cache[k] = cache_to_pyg_data(raw) 
 
-LOG_FILE = "/mnt/data/logs.txt"
+LOG_FILE = "/content/logs.txt"
 
 def log(msg):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -87,7 +88,8 @@ model = TwoHeadConditional(
     dim_p=768, emb_dim=300,
     d_model=512,
     n_targets=NUM_T,
-    n_dirs=NUM_D
+    n_dirs=NUM_D,
+    gnn_ckpt = gnn_ckpt
 ).to(DEVICE)
 
 opt = torch.optim.AdamW(model.parameters(), lr=LR)
@@ -107,7 +109,12 @@ def evaluate(loader):
     all_true_t, all_true_d = [], []
 
     with torch.no_grad():
-        for p, d, y_t, y_d in loader:
+        for batch_idx, batch in enumerate(train_loader):
+            p = batch["protein_embeddings"]  # (B, 768)
+            d = batch["drug_graphs"]         # PyG Batch object
+            y_t   = batch["target_ids"]          # (B,)
+            y_d   = batch["direction_ids"]       # (B,)
+
             p, d = p.to(DEVICE), d.to(DEVICE)
             y_t, y_d = y_t.to(DEVICE), y_d.to(DEVICE)
             logit_t, logit_d = model(p, d)
@@ -128,7 +135,16 @@ for epoch in range(EPOCHS):
     model.train()
     total_loss = 0
 
-    for p_vec, d_vec, y_t, y_d in train_loader:
+    for batch_idx, batch in enumerate(train_loader):
+        p_vec = batch["protein_embeddings"]  # (B, 768)
+        d_vec = batch["drug_graphs"]         # PyG Batch object
+        y_t   = batch["target_ids"]          # (B,)
+        y_d   = batch["direction_ids"]       # (B,)
+
+        # log(f"[BATCH {batch_idx}] p_vec shape: {p_vec.shape}")
+        # log(f"[BATCH {batch_idx}] d_vec.num_graphs: {d_vec.num_graphs}")
+        # log(f"[BATCH {batch_idx}] y_t shape: {y_t.shape}, y_d shape: {y_d.shape}")
+
         p_vec, d_vec = p_vec.to(DEVICE), d_vec.to(DEVICE)
         y_t, y_d = y_t.to(DEVICE), y_d.to(DEVICE)
 
@@ -139,11 +155,14 @@ for epoch in range(EPOCHS):
         loss_d = crit_d(logit_d, y_d)
         loss = loss_t + loss_d
 
+        if batch_idx % 100 == 0:
+            log(f"[E{epoch+1} B{batch_idx}] Loss_t: {loss_t.item():.4f}, "
+                f"Loss_d: {loss_d.item():.4f}, Total: {loss.item():.4f}")
+
         loss.backward()
         opt.step()
 
         total_loss += loss.item()
-
     avg_loss = total_loss / len(train_loader)
     print(f"\n[EPOCH {epoch+1}/{EPOCHS}] Loss: {avg_loss:.4f}")
 
