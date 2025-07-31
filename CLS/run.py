@@ -20,11 +20,11 @@ LR = 1e-4
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SEG_DF_PATH = "/content/drive/MyDrive/GeneDrugChat-Data/analysis_outputs/segments_2head.csv"
-VOCAB_PATH  = "/content/drive/MyDrive/GeneDrugChat-Data/analysis_outputs/vocab_2head.json"
-LMDB_PATH   = '/content/local_lmdb'
-DRUG_CACHE  = '/content/drive/MyDrive/GeneDrugChat-Data/smiles_cache.pkl'
-gnn_ckpt = '/content/drive/MyDrive/GeneDrugChat-Data/gcn_contextpred.pth'
+SEG_DF_PATH = '/mnt/data/cls/segments_2head.csv'
+VOCAB_PATH  = '/mnt/data/cls/vocab_2head.json'
+LMDB_PATH   = '/mnt/data/gene_data/mean-pooled-all.lmdb'
+DRUG_CACHE  = '/mnt/data/graph_cache.pkl'
+gnn_ckpt = '/mnt/data/gcn_contextpred.pth'
 
 def cache_to_pyg_data(graph_dict):
     """Convert cached graph to PyG Data object"""
@@ -78,12 +78,9 @@ def log(msg):
 
 # -------------------- LOAD DATA --------------------
 with open(DRUG_CACHE, "rb") as f:
-    smiles_cache_raw = pickle.load(f)
-graph_cache = {}
-for k, raw in tqdm.tqdm(smiles_cache_raw.items(), desc="Building PyG graphs"):
-    graph_cache[k] = cache_to_pyg_data(raw) 
+    graph_cache = pickle.load(f)
 
-LOG_FILE = "/content/logs.txt"
+LOG_FILE = "/mnt/data/cls/logs.txt"
 
 seg_df = pd.read_csv(SEG_DF_PATH)
 
@@ -100,22 +97,16 @@ dataset = ProteinDrugInteractionDataset(
     protein_lmdb_path=LMDB_PATH,
     smiles_cache=graph_cache
 )
-
-
 # Split
 N = len(dataset)
 train_size = int(0.8 * N)
 val_size = N - train_size
 train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-all_target_ids = [train_set[i]["target_ids"] for i in range(len(train_set))]
+all_target_ids = [train_set[i]["target_id"] for i in range(len(train_set))]
 target_counts = Counter(all_target_ids)
-
-# Compute inverse frequency for each class
 target_weights = {cls: 1.0 / (count + 1e-6) for cls, count in target_counts.items()}
-
-# Assign sample weights based on their class
-sample_weights = [target_weights[train_set[i]["target_ids"]] for i in range(len(train_set))]
+sample_weights = [target_weights[train_set[i]["target_id"]] for i in range(len(train_set))]
 
 # Create the sampler
 sampler = WeightedRandomSampler(
@@ -135,8 +126,8 @@ all_targets = []
 all_directions = []
 for i in range(len(train_set)):
     item = train_set[i]
-    all_targets.append(item["target_ids"])
-    all_directions.append(item["direction_ids"])
+    all_targets.append(item["target_id"])
+    all_directions.append(item["direction_id"])
 
 target_counts = Counter(all_targets)
 direction_counts = Counter(all_directions)

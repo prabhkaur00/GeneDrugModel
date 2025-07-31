@@ -5,7 +5,7 @@ from torch_geometric.data import Batch
 import datetime
 from gnn import GNN_graphpred
 
-LOG_FILE = "/content/logs.txt"
+LOG_FILE = "/mnt/data/cls/logs.txt"
 
 def log(msg):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
