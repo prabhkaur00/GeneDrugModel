@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.metrics import classification_report
 from model import TwoHeadConditional               # your model
 from loader import ProteinDrugInteractionDataset  # your dataset
@@ -11,6 +11,8 @@ import pickle
 import tqdm
 from torch_geometric.data import Data, Batch
 import datetime
+from collections import Counter
+import torch.nn.functional as F
 # -------------------- CONFIG --------------------
 BATCH_SIZE = 64
 EPOCHS = 10
@@ -39,70 +41,6 @@ def cache_to_pyg_data(graph_dict):
     )
     return data
 
-with open(DRUG_CACHE, "rb") as f:
-    smiles_cache_raw = pickle.load(f)
-graph_cache = {}
-for k, raw in tqdm.tqdm(smiles_cache_raw.items(), desc="Building PyG graphs"):
-    graph_cache[k] = cache_to_pyg_data(raw) 
-
-LOG_FILE = "/content/logs.txt"
-
-def log(msg):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    full_msg = f"[{timestamp}] {msg}"
-    print(full_msg)
-    with open(LOG_FILE, "a") as f:
-        f.write(full_msg + "\n")
-
-# -------------------- LOAD DATA --------------------
-seg_df = pd.read_csv(SEG_DF_PATH)
-
-with open(VOCAB_PATH) as f:
-    vocabs = json.load(f)
-target2id = vocabs["target2id"]
-direction2id = vocabs["direction2id"]
-NUM_T = len(target2id)
-NUM_D = len(direction2id)
-
-
-dataset = ProteinDrugInteractionDataset(
-    seg_df=seg_df,
-    protein_lmdb_path=LMDB_PATH,
-    smiles_cache=graph_cache
-)
-
-# Split
-N = len(dataset)
-train_size = int(0.8 * N)
-val_size = N - train_size
-train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
-                          collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True)
-val_loader = DataLoader(val_set, batch_size=BATCH_SIZE,
-                        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True)
-# ----------------------------------------------------
-
-# -------------------- MODEL --------------------
-model = TwoHeadConditional(
-    dim_p=768, emb_dim=300,
-    d_model=512,
-    n_targets=NUM_T,
-    n_dirs=NUM_D,
-    gnn_ckpt = gnn_ckpt
-).to(DEVICE)
-
-opt = torch.optim.AdamW(model.parameters(), lr=LR)
-crit_t = torch.nn.CrossEntropyLoss()
-crit_d = torch.nn.CrossEntropyLoss()
-
-def count_trainable_params(model):
-    total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log(f"[PARAMS] Total trainable: {total:,}")
-    return total
-# ------------------------------------------------
-
-# -------------------- TRAINING LOOP --------------------
 def evaluate(loader):
     model.eval()
     all_preds_t, all_preds_d = [], []
@@ -131,6 +69,108 @@ def evaluate(loader):
 
     return report_t, report_d
 
+def log(msg):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    full_msg = f"[{timestamp}] {msg}"
+    print(full_msg)
+    with open(LOG_FILE, "a") as f:
+        f.write(full_msg + "\n")
+
+# -------------------- LOAD DATA --------------------
+with open(DRUG_CACHE, "rb") as f:
+    smiles_cache_raw = pickle.load(f)
+graph_cache = {}
+for k, raw in tqdm.tqdm(smiles_cache_raw.items(), desc="Building PyG graphs"):
+    graph_cache[k] = cache_to_pyg_data(raw) 
+
+LOG_FILE = "/content/logs.txt"
+
+seg_df = pd.read_csv(SEG_DF_PATH)
+
+with open(VOCAB_PATH) as f:
+    vocabs = json.load(f)
+target2id = vocabs["target2id"]
+direction2id = vocabs["direction2id"]
+NUM_T = len(target2id)
+NUM_D = len(direction2id)
+
+
+dataset = ProteinDrugInteractionDataset(
+    seg_df=seg_df,
+    protein_lmdb_path=LMDB_PATH,
+    smiles_cache=graph_cache
+)
+
+
+# Split
+N = len(dataset)
+train_size = int(0.8 * N)
+val_size = N - train_size
+train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+all_target_ids = [train_set[i]["target_ids"] for i in range(len(train_set))]
+target_counts = Counter(all_target_ids)
+
+# Compute inverse frequency for each class
+target_weights = {cls: 1.0 / (count + 1e-6) for cls, count in target_counts.items()}
+
+# Assign sample weights based on their class
+sample_weights = [target_weights[train_set[i]["target_ids"]] for i in range(len(train_set))]
+
+# Create the sampler
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(train_set),  # or larger for heavy oversampling
+    replacement=True
+)
+
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
+                          collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True)
+val_loader = DataLoader(val_set, batch_size=BATCH_SIZE,
+                        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True)
+
+# -------------------- MODEL --------------------
+# Count class frequencies in train set
+all_targets = []
+all_directions = []
+for i in range(len(train_set)):
+    item = train_set[i]
+    all_targets.append(item["target_ids"])
+    all_directions.append(item["direction_ids"])
+
+target_counts = Counter(all_targets)
+direction_counts = Counter(all_directions)
+
+def compute_class_weights(counter, num_classes):
+    freq = torch.tensor([counter.get(i, 0) for i in range(num_classes)], dtype=torch.float)
+    freq = freq.clamp(min=1.0)
+    weights = torch.log(freq.sum() / freq)
+    weights = weights / weights.sum() * num_classes
+    return weights.to(DEVICE)
+
+model = TwoHeadConditional(
+    dim_p=768, emb_dim=300,
+    d_model=512,
+    n_targets=NUM_T,
+    n_dirs=NUM_D,
+    gnn_ckpt = gnn_ckpt
+).to(DEVICE)
+
+opt = torch.optim.AdamW(model.parameters(), lr=LR)
+target_weights = compute_class_weights(target_counts, NUM_T)
+direction_weights = compute_class_weights(direction_counts, NUM_D)
+crit_t = torch.nn.CrossEntropyLoss(weight=target_weights)
+crit_d = torch.nn.CrossEntropyLoss(weight=direction_weights)
+
+def count_trainable_params(model):
+    total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log(f"[PARAMS] Total trainable: {total:,}")
+    return total
+
+count_trainable_params(model)
+# ------------------------------------------------
+
+# -------------------- TRAINING LOOP --------------------
 for epoch in range(EPOCHS):
     model.train()
     total_loss = 0

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Batch
 import datetime
-from gnn import GNN_graphpred  # your GNN class
+from gnn import GNN_graphpred
 
 LOG_FILE = "/content/logs.txt"
 
@@ -64,7 +64,7 @@ class BilinearGate(nn.Module):
         return fuse
 
 class TwoHeadConditional(nn.Module):
-    def __init__(self, dim_p=768, emb_dim=300, d_model=512, n_targets=10, n_dirs=3,
+    def __init__(self, dim_p=768, emb_dim=300, d_model=512, n_targets=15, n_dirs=3,
                  gnn_ckpt=None, freeze_gnn=True):
         super().__init__()
         self.gnn = self.create_gnn(gnn_ckpt, freeze_gnn)
