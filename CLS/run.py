@@ -28,6 +28,7 @@ VOCAB_PATH  = '/mnt/data/cls/vocab_2head.json'
 LMDB_PATH   = '/mnt/data/gene_data/mean-pooled-all.lmdb'
 DRUG_CACHE  = '/mnt/data/graph_cache.pkl'
 gnn_ckpt = '/mnt/data/gcn_contextpred.pth'
+ckpt_dir = 'mnt/data/cls/checkpoints'
 
 def cache_to_pyg_data(graph_dict):
     """Convert cached graph to PyG Data object"""
@@ -222,7 +223,7 @@ def count_trainable_params(model):
     return total
 
 count_trainable_params(model)
-ckpt_dir = Path("cls/checkpoints")
+
 ckpt_dir.mkdir(exist_ok=True)
 best_f1 = 0
 best_epoch = -1
