@@ -224,7 +224,6 @@ def count_trainable_params(model):
 
 count_trainable_params(model)
 
-ckpt_dir.mkdir(exist_ok=True)
 best_f1 = 0
 best_epoch = -1
 # -------------------- TRAINING LOOP --------------------
