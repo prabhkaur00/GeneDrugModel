@@ -13,13 +13,16 @@ from torch_geometric.data import Data, Batch
 import datetime
 from collections import Counter
 import torch.nn.functional as F
+import multiprocessing
+from pathlib import Path
+
 # -------------------- CONFIG --------------------
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 EPOCHS = 10
 LR = 1e-4
-NUM_WORKERS = 4
+NUM_WORKERS = multiprocessing.cpu_count()  # Use all available CPU cores
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+print(f"config: BATCH_SIZE={BATCH_SIZE}, EPOCHS={EPOCHS}, LR={LR}, NUM_WORKERS={NUM_WORKERS}, DEVICE={DEVICE}")
 SEG_DF_PATH = '/mnt/data/cls/segments_2head.csv'
 VOCAB_PATH  = '/mnt/data/cls/vocab_2head.json'
 LMDB_PATH   = '/mnt/data/gene_data/mean-pooled-all.lmdb'
@@ -76,6 +79,33 @@ def log(msg):
     with open(LOG_FILE, "a") as f:
         f.write(full_msg + "\n")
 
+class FocalLoss(torch.nn.Module):
+    def __init__(self, weight=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce = torch.nn.CrossEntropyLoss(weight=weight, reduction='none')
+
+    def forward(self, input, target):
+        ce_loss = self.ce(input, target)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+def get_loss(loss_type, weight=None, gamma=2.0):
+    if loss_type == "cross_entropy":
+        return torch.nn.CrossEntropyLoss(weight=weight)
+    elif loss_type == "focal":
+        return FocalLoss(weight=weight, gamma=gamma)
+    else:
+        raise ValueError(f"Unsupported loss type: {loss_type}")
+
 # -------------------- LOAD DATA --------------------
 with open(DRUG_CACHE, "rb") as f:
     graph_cache = pickle.load(f)
@@ -91,13 +121,11 @@ direction2id = vocabs["direction2id"]
 NUM_T = len(target2id)
 NUM_D = len(direction2id)
 
-
 dataset = ProteinDrugInteractionDataset(
     seg_df=seg_df,
     protein_lmdb_path=LMDB_PATH,
     smiles_cache=graph_cache
 )
-# Split
 N = len(dataset)
 train_size = int(0.8 * N)
 val_size = N - train_size
@@ -108,17 +136,33 @@ target_counts = Counter(all_target_ids)
 target_weights = {cls: 1.0 / (count + 1e-6) for cls, count in target_counts.items()}
 sample_weights = [target_weights[train_set[i]["target_id"]] for i in range(len(train_set))]
 
-# Create the sampler
 sampler = WeightedRandomSampler(
     weights=sample_weights,
-    num_samples=len(train_set),  # or larger for heavy oversampling
+    num_samples=len(train_set),
     replacement=True
 )
 
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
-                          collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True)
-val_loader = DataLoader(val_set, batch_size=BATCH_SIZE,
-                        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True)
+train_loader = DataLoader(
+    train_set,
+    batch_size=BATCH_SIZE,
+    sampler=sampler,
+    collate_fn=collate_fn,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4
+)
+
+val_loader = DataLoader(
+    val_set,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    collate_fn=collate_fn,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4
+)
 
 # -------------------- MODEL --------------------
 # Count class frequencies in train set
@@ -153,51 +197,59 @@ direction_weights = compute_class_weights(direction_counts, NUM_D)
 crit_t = torch.nn.CrossEntropyLoss(weight=target_weights)
 crit_d = torch.nn.CrossEntropyLoss(weight=direction_weights)
 
+opt = torch.optim.AdamW(model.parameters(), lr=LR)
+loss_config = {
+    "type": "focal",
+    "gamma": 2.0
+} ### loss_config = {"type": "cross_entropy"}
+target_weights = compute_class_weights(target_counts, NUM_T)
+direction_weights = compute_class_weights(direction_counts, NUM_D)
+gamma = loss_config["gamma"] if loss_config["type"] == "focal" else None
+crit_t = get_loss(
+    loss_type=loss_config["type"],
+    weight=target_weights.to(DEVICE),
+    gamma=gamma
+)
+crit_d = get_loss(
+    loss_type=loss_config["type"],
+    weight=direction_weights.to(DEVICE),
+    gamma=gamma
+)
+
 def count_trainable_params(model):
     total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f"[PARAMS] Total trainable: {total:,}")
     return total
 
 count_trainable_params(model)
-# ------------------------------------------------
-
+ckpt_dir = Path("cls/checkpoints")
+ckpt_dir.mkdir(exist_ok=True)
+best_f1 = 0
+best_epoch = -1
 # -------------------- TRAINING LOOP --------------------
 for epoch in range(EPOCHS):
     model.train()
     total_loss = 0
-
     for batch_idx, batch in enumerate(train_loader):
         p_vec = batch["protein_embeddings"]  # (B, 768)
         d_vec = batch["drug_graphs"]         # PyG Batch object
         y_t   = batch["target_ids"]          # (B,)
         y_d   = batch["direction_ids"]       # (B,)
-
-        # log(f"[BATCH {batch_idx}] p_vec shape: {p_vec.shape}")
-        # log(f"[BATCH {batch_idx}] d_vec.num_graphs: {d_vec.num_graphs}")
-        # log(f"[BATCH {batch_idx}] y_t shape: {y_t.shape}, y_d shape: {y_d.shape}")
-
         p_vec, d_vec = p_vec.to(DEVICE), d_vec.to(DEVICE)
         y_t, y_d = y_t.to(DEVICE), y_d.to(DEVICE)
-
         opt.zero_grad()
         logit_t, logit_d = model(p_vec, d_vec)
-
         loss_t = crit_t(logit_t, y_t)
         loss_d = crit_d(logit_d, y_d)
         loss = loss_t + loss_d
-
         if batch_idx % 100 == 0:
             log(f"[E{epoch+1} B{batch_idx}] Loss_t: {loss_t.item():.4f}, "
                 f"Loss_d: {loss_d.item():.4f}, Total: {loss.item():.4f}")
-
         loss.backward()
         opt.step()
-
         total_loss += loss.item()
     avg_loss = total_loss / len(train_loader)
     print(f"\n[EPOCH {epoch+1}/{EPOCHS}] Loss: {avg_loss:.4f}")
-
-    # Eval
     report_t, report_d = evaluate(val_loader)
     print("Target Head Report:\n", report_t)
     print("Direction Head Report:\n", report_d)
