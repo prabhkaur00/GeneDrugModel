@@ -21,7 +21,8 @@ BATCH_SIZE   = int(os.getenv("BATCH_SIZE", 128))
 EPOCHS       = int(os.getenv("EPOCHS", 10))
 LR           = float(os.getenv("LR", 1e-4))
 NUM_WORKERS  = int(os.getenv("NUM_WORKERS", 0))
-PREFETCH_FACTOR  = int(os.getenv("PREFETCH_FACTOR", None))
+PREFETCH_FACTOR = os.getenv("PREFETCH_FACTOR")
+PREFETCH_FACTOR = int(PREFETCH_FACTOR) if PREFETCH_FACTOR is not None else None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"config: BATCH_SIZE={BATCH_SIZE}, EPOCHS={EPOCHS}, LR={LR}, NUM_WORKERS={NUM_WORKERS}, DEVICE={DEVICE}")
 SEG_DF_PATH = '/mnt/data/cls/segments_2head.csv'
