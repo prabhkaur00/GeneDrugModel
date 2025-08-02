@@ -17,10 +17,10 @@ import multiprocessing
 from pathlib import Path
 
 # -------------------- CONFIG --------------------
-BATCH_SIZE = 128
-EPOCHS = 10
-LR = 1e-4
-NUM_WORKERS = multiprocessing.cpu_count()  # Use all available CPU cores
+BATCH_SIZE   = int(os.getenv("BATCH_SIZE", 128))
+EPOCHS       = int(os.getenv("EPOCHS", 10))
+LR           = float(os.getenv("LR", 1e-4))
+NUM_WORKERS  = int(os.getenv("NUM_WORKERS", 0))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"config: BATCH_SIZE={BATCH_SIZE}, EPOCHS={EPOCHS}, LR={LR}, NUM_WORKERS={NUM_WORKERS}, DEVICE={DEVICE}")
 SEG_DF_PATH = '/mnt/data/cls/segments_2head.csv'
