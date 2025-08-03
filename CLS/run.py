@@ -152,7 +152,7 @@ train_loader = DataLoader(
     collate_fn=collate_fn,
     num_workers=NUM_WORKERS,
     pin_memory=True,
-    persistent_workers=True,
+    persistent_workers=(NUM_WORKERS > 0),
     prefetch_factor=PREFETCH_FACTOR
 )
 
@@ -163,7 +163,7 @@ val_loader = DataLoader(
     collate_fn=collate_fn,
     num_workers=NUM_WORKERS,
     pin_memory=True,
-    persistent_workers=True,
+    persistent_workers=(NUM_WORKERS > 0),
     prefetch_factor=PREFETCH_FACTOR
 )
 
