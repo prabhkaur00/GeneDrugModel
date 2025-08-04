@@ -22,6 +22,7 @@ EPOCHS       = int(os.getenv("EPOCHS", 10))
 LR           = float(os.getenv("LR", 1e-4))
 NUM_WORKERS  = int(os.getenv("NUM_WORKERS", 0))
 PREFETCH_FACTOR = os.getenv("PREFETCH_FACTOR")
+WEIGHTED_SAMPLING = os.getenv("WEIGHTED_SAMPLING", "True").lower() == "true"
 PREFETCH_FACTOR = int(PREFETCH_FACTOR) if PREFETCH_FACTOR is not None else None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"config: BATCH_SIZE={BATCH_SIZE}, EPOCHS={EPOCHS}, LR={LR}, NUM_WORKERS={NUM_WORKERS}, DEVICE={DEVICE}")
@@ -47,13 +48,13 @@ def cache_to_pyg_data(graph_dict):
     )
     return data
 
-def evaluate(loader):
+def evaluate(val_loader):
     model.eval()
     all_preds_t, all_preds_d = [], []
     all_true_t, all_true_d = [], []
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(val_loader):
             p = batch["protein_embeddings"]  # (B, 768)
             d = batch["drug_graphs"]         # PyG Batch object
             y_t   = batch["target_ids"]          # (B,)
@@ -140,7 +141,7 @@ target_weights = {cls: 1.0 / (count + 1e-6) for cls, count in target_counts.item
 sample_weights = [target_weights[train_set[i]["target_id"]] for i in range(len(train_set))]
 
 sampler = WeightedRandomSampler(
-    weights=sample_weights,
+    weights=  sample_weights if WEIGHTED_SAMPLING else None
     num_samples=len(train_set),
     replacement=True
 )
