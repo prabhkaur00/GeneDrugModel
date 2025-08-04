@@ -25,7 +25,7 @@ PREFETCH_FACTOR = os.getenv("PREFETCH_FACTOR")
 WEIGHTED_SAMPLING = os.getenv("WEIGHTED_SAMPLING", "True").lower() == "true"
 PREFETCH_FACTOR = int(PREFETCH_FACTOR) if PREFETCH_FACTOR is not None else None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"config: BATCH_SIZE={BATCH_SIZE}, EPOCHS={EPOCHS}, LR={LR}, NUM_WORKERS={NUM_WORKERS}, DEVICE={DEVICE}")
+print(f"config: BATCH_SIZE={BATCH_SIZE}, EPOCHS={EPOCHS}, LR={LR}, NUM_WORKERS={NUM_WORKERS}, DEVICE={DEVICE}, WEIGHTED_SAMPLING={WEIGHTED_SAMPLING}, PREFETCH_FACTOR={PREFETCH_FACTOR}")
 SEG_DF_PATH = '/mnt/data/cls/segments_2head.csv'
 VOCAB_PATH  = '/mnt/data/cls/vocab_2head.json'
 LMDB_PATH   = '/mnt/data/gene_data/mean-pooled-all.lmdb'
@@ -141,7 +141,7 @@ target_weights = {cls: 1.0 / (count + 1e-6) for cls, count in target_counts.item
 sample_weights = [target_weights[train_set[i]["target_id"]] for i in range(len(train_set))]
 
 sampler = WeightedRandomSampler(
-    weights=  sample_weights if WEIGHTED_SAMPLING else None
+    weights=  sample_weights,
     num_samples=len(train_set),
     replacement=True
 )
@@ -149,7 +149,8 @@ sampler = WeightedRandomSampler(
 train_loader = DataLoader(
     train_set,
     batch_size=BATCH_SIZE,
-    sampler=sampler,
+    sampler=sampler if WEIGHTED_SAMPLING else None,
+    shuffle=False if WEIGHTED_SAMPLING else True,
     collate_fn=collate_fn,
     num_workers=NUM_WORKERS,
     pin_memory=True,
