@@ -2,9 +2,9 @@ import re, json, pandas as pd
 from pathlib import Path
 
 # ---------- CONFIG ----------
-FILE_PATH   = "/Users/prabhleenkaur/Code/GeneDrugChat/Data/tier1_smiles.csv"
+FILE_PATH   = "/Users/prabhleenkaur/Code/GeneDrugChat/Data/tier1_smiles_5k.csv"
 COLUMN_NAME = "Interaction"
-OUT_DIR     = Path("./cls_data")
+OUT_DIR     = Path("./cls_data_5k")
 OUT_DIR.mkdir(exist_ok=True)
 OUT_CSV     = OUT_DIR / "segments_2head.csv"
 OUT_JSONL   = OUT_DIR / "segments_2head.jsonl"
@@ -122,18 +122,69 @@ for k, v in direction_counts.items():
 seg_df = pd.DataFrame(rows)
 seg_df.to_csv(OUT_CSV, index=False)
 
-# Save JSONL
-with open(OUT_JSONL, "w") as f:
-    for r in rows:
-        f.write(json.dumps(r) + "\n")
+# -------------------- Stage-B (expression + methylation only) --------------------
+TWO_HEAD_TARGETS = {"expression", "methylation"}
 
-# Save vocab maps
-with open(VOCAB_JSON, "w") as f:
-    json.dump({"target2id": target2id, "direction2id": direction2id}, f, indent=2)
+seg2 = seg_df[seg_df["target"].isin(TWO_HEAD_TARGETS)].copy().reset_index(drop=True)
 
-print(f"Segments written: {len(rows)}")
-print(f"CSV:    {OUT_CSV}")
-print(f"JSONL:  {OUT_JSONL}")
-print(f"Vocabs: {VOCAB_JSON}")
-print("Targets:", target2id)
-print("Directions:", direction2id)
+# Recompute vocabularies for the 2-head setup
+# After seg2 is built (expression + methylation only)
+targets2 = ['expression', 'methylation']
+directions2 = ['increase', 'decrease', 'none']
+TARGET2ID_CANON   = {'expression': 0, 'methylation': 1}
+DIRECTION2ID_CANON = {'increase': 0, 'decrease': 1, 'none': 2}
+
+seg2['target_id']    = seg2['target'].map(TARGET2ID_CANON)
+seg2['direction_id'] = seg2['direction'].map(DIRECTION2ID_CANON)
+
+with open("vocab.json", "w") as f:
+    json.dump({"target2id": TARGET2ID_CANON, "direction2id": DIRECTION2ID_CANON}, f, indent=2)
+# Print stats for expression/methylation only
+from collections import Counter
+t_counts_2 = Counter(seg2["target"])
+d_counts_2 = Counter(seg2["direction"])
+
+print("\n[Stage-B Target Class Counts] (expression + methylation)")
+for k in targets2:
+    print(f"{k:>12}: {t_counts_2.get(k, 0)}")
+
+print("\n[Stage-B Direction Class Counts] (within expression+methylation rows)")
+for k in directions2:
+    print(f"{k:>12}: {d_counts_2.get(k, 0)}")
+
+# Save filtered CSV/JSONL/VOCAB for Stage-B
+OUT_CSV_2   = OUT_DIR / "segments_stageB_expr_meth.csv"
+OUT_JSONL_2 = OUT_DIR / "segments_stageB_expr_meth.jsonl"
+VOCAB_JSON2 = OUT_DIR / "vocab_stageB_expr_meth.json"
+
+seg2.to_csv(OUT_CSV_2, index=False)
+
+with open(OUT_JSONL_2, "w") as f:
+    for _, r in seg2.iterrows():
+        f.write(json.dumps(r.to_dict()) + "\n")
+
+with open(VOCAB_JSON2, "w") as f:
+    json.dump({"target2id": TARGET2ID_CANON, "direction2id": DIRECTION2ID_CANON}, f, indent=2)
+
+print(f"\n[Stage-B files]")
+print(f"CSV:    {OUT_CSV_2}")
+print(f"JSONL:  {OUT_JSONL_2}")
+print(f"Vocabs: {VOCAB_JSON2}")
+print("Targets (Stage-B):", TARGET2ID_CANON)
+print("Directions (Stage-B):", DIRECTION2ID_CANON)
+
+# # Save JSONL
+# with open(OUT_JSONL, "w") as f:
+#     for r in rows:
+#         f.write(json.dumps(r) + "\n")
+
+# # Save vocab maps
+# with open(VOCAB_JSON, "w") as f:
+#     json.dump({"target2id": target2id, "direction2id": direction2id}, f, indent=2)
+
+# print(f"Segments written: {len(rows)}")
+# print(f"CSV:    {OUT_CSV}")
+# print(f"JSONL:  {OUT_JSONL}")
+# print(f"Vocabs: {VOCAB_JSON}")
+# print("Targets:", target2id)
+# print("Directions:", direction2id)

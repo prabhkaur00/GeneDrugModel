@@ -1,260 +1,192 @@
-import torch
+#!/usr/bin/env python3
+import os, json, pickle, datetime
+import torch, torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.metrics import classification_report
-from model import TwoHeadConditional               # your model
-from loader import ProteinDrugInteractionDataset  # your dataset
-from loader import collate_fn                     # your collate_fn
-import pandas as pd
-import json
-import os
-import pickle
-import tqdm
-from torch_geometric.data import Data, Batch
-import datetime
 from collections import Counter
-import torch.nn.functional as F
-import multiprocessing
-from pathlib import Path
+import pandas as pd
+from model import StageBJoint
+from loader import ProteinDrugInteractionDataset, collate_fn
 
-# -------------------- CONFIG --------------------
+# -------------------- CONFIG (env-driven) --------------------
 BATCH_SIZE   = int(os.getenv("BATCH_SIZE", 128))
 EPOCHS       = int(os.getenv("EPOCHS", 10))
-LR           = float(os.getenv("LR", 1e-4))
+LR           = float(os.getenv("LR", 3e-4))               # good starting LR
+LR_MIN       = float(os.getenv("LR_MIN", 3e-5))           # floor for cosine
+WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", 0.01))
+WARMUP_FRAC  = float(os.getenv("WARMUP_FRAC", 0.05))      # 5% warmup
+IMB_STRAT    = os.getenv("IMBALANCE_STRATEGY", "focal")   # focal|weights|sampler|none
+FOCAL_GAMMA  = float(os.getenv("FOCAL_GAMMA", 1.75))      # easy to sweep
+LAMBDA_T     = float(os.getenv("LAMBDA_T", 1.0))          # target head weight
+LAMBDA_D     = float(os.getenv("LAMBDA_D", 1.0))          # direction head weight
+
+USE_XATTN    = os.getenv("USE_XATTN", "true").lower()=="true"
+FREEZE_GNN   = os.getenv("FREEZE_GNN", "true").lower()=="true"
+GNN          = os.getenv("GNN", "gin")
 NUM_WORKERS  = int(os.getenv("NUM_WORKERS", 0))
-PREFETCH_FACTOR = os.getenv("PREFETCH_FACTOR")
-WEIGHTED_SAMPLING = os.getenv("WEIGHTED_SAMPLING", "True").lower() == "true"
-PREFETCH_FACTOR = int(PREFETCH_FACTOR) if PREFETCH_FACTOR is not None else None
+PREFETCH_FACTOR = int(os.getenv("PREFETCH_FACTOR")) if os.getenv("PREFETCH_FACTOR") else None
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"config: BATCH_SIZE={BATCH_SIZE}, EPOCHS={EPOCHS}, LR={LR}, NUM_WORKERS={NUM_WORKERS}, DEVICE={DEVICE}, WEIGHTED_SAMPLING={WEIGHTED_SAMPLING}, PREFETCH_FACTOR={PREFETCH_FACTOR}")
-SEG_DF_PATH = '/mnt/data/cls/segments_2head.csv'
-VOCAB_PATH  = '/mnt/data/cls/vocab_2head.json'
-LMDB_PATH   = '/mnt/data/gene_data/mean-pooled-all.lmdb'
-DRUG_CACHE  = '/mnt/data/graph_cache.pkl'
-gnn_ckpt = '/mnt/data/gcn_contextpred.pth'
-ckpt_dir = 'mnt/data/cls/checkpoints'
+SEG_DF_PATH = os.getenv("SEG_DF_PATH", "/mnt/data/cls/segments_2head.csv")
+VOCAB_PATH  = os.getenv("VOCAB_PATH",  "/mnt/data/cls/vocab_minimal.json")
+LMDB_PATH   = os.getenv("LMDB_PATH",   "/mnt/data/gene_data/lmdb_parts")
+DRUG_CACHE  = os.getenv("DRUG_CACHE",  "/mnt/data/graph_cache.pkl")
+gnn_ckpt    = '/mnt/data/gcn_contextpred.pth' if GNN=="gcn" else '/mnt/data/gin_contextpred.pth'
+LOG_FILE    = os.getenv("LOG_FILE", "/mnt/data/cls/logs.txt")
 
-def cache_to_pyg_data(graph_dict):
-    """Convert cached graph to PyG Data object"""
-    edge_index = torch.tensor(graph_dict['edge_index'], dtype=torch.long)
-    edge_feat = torch.tensor(graph_dict['edge_feat'], dtype=torch.long)
-    node_feat = torch.tensor(graph_dict['node_feat'], dtype=torch.long)
-    num_nodes = graph_dict['num_nodes']
+print(f"cfg: BS={BATCH_SIZE} E={EPOCHS} LR={LR} WD={WEIGHT_DECAY} warmup={WARMUP_FRAC} "
+      f"gamma={FOCAL_GAMMA} imb={IMB_STRAT} xattn={USE_XATTN} freeze_gnn={FREEZE_GNN} "
+      f"nw={NUM_WORKERS} prefetch={PREFETCH_FACTOR} device={DEVICE}")
 
-    data = Data(
-        x=node_feat,
-        edge_index=edge_index,
-        edge_attr=edge_feat,
-        num_nodes=num_nodes
-    )
-    return data
-
-def evaluate(val_loader):
-    model.eval()
-    all_preds_t, all_preds_d = [], []
-    all_true_t, all_true_d = [], []
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
-            p = batch["protein_embeddings"]  # (B, 768)
-            d = batch["drug_graphs"]         # PyG Batch object
-            y_t   = batch["target_ids"]          # (B,)
-            y_d   = batch["direction_ids"]       # (B,)
-
-            p, d = p.to(DEVICE), d.to(DEVICE)
-            y_t, y_d = y_t.to(DEVICE), y_d.to(DEVICE)
-            logit_t, logit_d = model(p, d)
-            pred_t = torch.argmax(logit_t, dim=-1)
-            pred_d = torch.argmax(logit_d, dim=-1)
-
-            all_preds_t.extend(pred_t.cpu().tolist())
-            all_preds_d.extend(pred_d.cpu().tolist())
-            all_true_t.extend(y_t.cpu().tolist())
-            all_true_d.extend(y_d.cpu().tolist())
-
-    report_t = classification_report(all_true_t, all_preds_t, target_names=target2id.keys(), zero_division=0)
-    report_d = classification_report(all_true_d, all_preds_d, target_names=direction2id.keys(), zero_division=0)
-
-    return report_t, report_d
-
+# -------------------- UTILS --------------------
 def log(msg):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    full_msg = f"[{timestamp}] {msg}"
-    print(full_msg)
-    with open(LOG_FILE, "a") as f:
-        f.write(full_msg + "\n")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    full = f"[{ts}] {msg}"
+    print(full, flush=True)
+    with open(LOG_FILE, "a") as f: f.write(full + "\n")
 
-class FocalLoss(torch.nn.Module):
-    def __init__(self, weight=None, gamma=2.0, reduction='mean'):
+def compute_class_weights(counter, num_classes, device):
+    freq = torch.tensor([counter.get(i, 0) for i in range(num_classes)], dtype=torch.float)
+    freq = freq.clamp(min=1.0)
+    w = torch.log(freq.sum() / freq)
+    return (w / w.sum() * num_classes).to(device)
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0):
         super().__init__()
-        self.weight = weight
+        self.ce = nn.CrossEntropyLoss(weight=weight, reduction='none')
         self.gamma = gamma
-        self.reduction = reduction
-        self.ce = torch.nn.CrossEntropyLoss(weight=weight, reduction='none')
-
     def forward(self, input, target):
-        ce_loss = self.ce(input, target)
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
+        ce = self.ce(input, target)
+        pt = torch.exp(-ce)
+        return ((1-pt)**self.gamma * ce).mean()
 
-def get_loss(loss_type, weight=None, gamma=2.0):
-    if loss_type == "cross_entropy":
-        return torch.nn.CrossEntropyLoss(weight=weight)
-    elif loss_type == "focal":
-        return FocalLoss(weight=weight, gamma=gamma)
-    else:
-        raise ValueError(f"Unsupported loss type: {loss_type}")
+def make_loss(kind, weight=None, gamma=2.0):
+    if kind == "cross_entropy": return nn.CrossEntropyLoss(weight=weight)
+    if kind == "focal":        return FocalLoss(weight=weight, gamma=gamma)
+    raise ValueError(f"Unsupported loss: {kind}")
 
-# -------------------- LOAD DATA --------------------
-with open(DRUG_CACHE, "rb") as f:
-    graph_cache = pickle.load(f)
+def evaluate(model, loader, device, target_names, dir_names):
+    model.eval()
+    preds_t, preds_d, true_t, true_d = [], [], [], []
+    with torch.no_grad():
+        for batch in loader:
+            p, d = batch["protein_embeddings"].to(device), batch["drug_graphs"].to(device)
+            y_t, y_d = batch["target_ids"].to(device), batch["direction_ids"].to(device)
+            logit_t, logit_d = model(p, d)
+            preds_t.extend(torch.argmax(logit_t, -1).cpu().tolist())
+            preds_d.extend(torch.argmax(logit_d, -1).cpu().tolist())
+            true_t.extend(y_t.cpu().tolist())
+            true_d.extend(y_d.cpu().tolist())
+    rt = classification_report(true_t, preds_t, target_names=target_names, zero_division=0)
+    rd = classification_report(true_d, preds_d, target_names=dir_names, zero_division=0)
+    return rt, rd
 
-LOG_FILE = "/mnt/data/cls/logs.txt"
+def build_scheduler(optimizer, total_steps, warmup_frac, lr_min, base_lr):
+    warmup_steps = max(1, int(total_steps * warmup_frac))
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        # cosine to lr_min/base_lr
+        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine = 0.5 * (1 + torch.cos(torch.tensor(torch.pi * t))).item()
+        # scale so end hits lr_min/base_lr
+        end_ratio = lr_min / base_lr
+        return end_ratio + (1 - end_ratio) * cosine
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
+# -------------------- DATA --------------------
+with open(DRUG_CACHE, "rb") as f: graph_cache = pickle.load(f)
 seg_df = pd.read_csv(SEG_DF_PATH)
 
 with open(VOCAB_PATH) as f:
     vocabs = json.load(f)
-target2id = vocabs["target2id"]
-direction2id = vocabs["direction2id"]
-NUM_T = len(target2id)
-NUM_D = len(direction2id)
+target2id = vocabs["target2id"]; direction2id = vocabs["direction2id"]
+NUM_T, NUM_D = len(target2id), len(direction2id)
 
-dataset = ProteinDrugInteractionDataset(
-    seg_df=seg_df,
-    protein_lmdb_path=LMDB_PATH,
-    smiles_cache=graph_cache
+dataset = ProteinDrugInteractionDataset(seg_df, LMDB_PATH, graph_cache)
+train_set = ProteinDrugInteractionDataset(
+    tr_df, LMDB_PATH, graph_cache,
+    gid2lmdb_json="/mnt/data/geneid_to_lmdb.json"
 )
-N = len(dataset)
-train_size = int(0.8 * N)
-val_size = N - train_size
-train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-all_target_ids = [train_set[i]["target_id"] for i in range(len(train_set))]
-target_counts = Counter(all_target_ids)
-target_weights = {cls: 1.0 / (count + 1e-6) for cls, count in target_counts.items()}
-sample_weights = [target_weights[train_set[i]["target_id"]] for i in range(len(train_set))]
-
-sampler = WeightedRandomSampler(
-    weights=  sample_weights,
-    num_samples=len(train_set),
-    replacement=True
+val_set = ProteinDrugInteractionDataset(
+    va_df, LMDB_PATH, graph_cache,
+    gid2lmdb_json="/mnt/data/geneid_to_lmdb.json"
 )
+test_set = ProteinDrugInteractionDataset(
+    te_df, LMDB_PATH, graph_cache,
+    gid2lmdb_json="/mnt/data/geneid_to_lmdb.json"
+)
+targets = [train_set[i]["target_id"] for i in range(len(train_set))]
+dirs    = [train_set[i]["direction_id"] for i in range(len(train_set))]
+t_counts, d_counts = Counter(targets), Counter(dirs)
+sample_weights = [1.0 / (t_counts[t] + 1e-6) for t in targets]
+
+if IMB_STRAT == "sampler":
+    sampler, cw_t, cw_d, loss_kind = WeightedRandomSampler(sample_weights, len(train_set), True), None, None, "cross_entropy"
+elif IMB_STRAT == "weights":
+    sampler, cw_t, cw_d, loss_kind = None, compute_class_weights(t_counts, NUM_T, DEVICE), compute_class_weights(d_counts, NUM_D, DEVICE), "cross_entropy"
+elif IMB_STRAT == "focal":
+    sampler, cw_t, cw_d, loss_kind = None, None, None, "focal"
+else:
+    sampler, cw_t, cw_d, loss_kind = None, None, None, "cross_entropy"
 
 train_loader = DataLoader(
-    train_set,
-    batch_size=BATCH_SIZE,
-    sampler=sampler if WEIGHTED_SAMPLING else None,
-    shuffle=False if WEIGHTED_SAMPLING else True,
-    collate_fn=collate_fn,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-    persistent_workers=(NUM_WORKERS > 0),
-    prefetch_factor=PREFETCH_FACTOR
+    train_set, batch_size=BATCH_SIZE, sampler=sampler, shuffle=(sampler is None),
+    collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True,
+    persistent_workers=(NUM_WORKERS > 0), prefetch_factor=PREFETCH_FACTOR
 )
-
 val_loader = DataLoader(
-    val_set,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    collate_fn=collate_fn,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-    persistent_workers=(NUM_WORKERS > 0),
-    prefetch_factor=PREFETCH_FACTOR
+    val_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn,
+    num_workers=NUM_WORKERS, pin_memory=True,
+    persistent_workers=(NUM_WORKERS > 0), prefetch_factor=PREFETCH_FACTOR
 )
 
 # -------------------- MODEL --------------------
-# Count class frequencies in train set
-all_targets = []
-all_directions = []
-for i in range(len(train_set)):
-    item = train_set[i]
-    all_targets.append(item["target_id"])
-    all_directions.append(item["direction_id"])
-
-target_counts = Counter(all_targets)
-direction_counts = Counter(all_directions)
-
-def compute_class_weights(counter, num_classes):
-    freq = torch.tensor([counter.get(i, 0) for i in range(num_classes)], dtype=torch.float)
-    freq = freq.clamp(min=1.0)
-    weights = torch.log(freq.sum() / freq)
-    weights = weights / weights.sum() * num_classes
-    return weights.to(DEVICE)
-
-model = TwoHeadConditional(
-    dim_p=768, emb_dim=300,
-    d_model=512,
-    n_targets=NUM_T,
-    n_dirs=NUM_D,
-    gnn_ckpt = gnn_ckpt
+model = StageBJoint(
+    dim_p=768, emb_dim=300, d_model=512, n_dirs=NUM_D,
+    gnn_ckpt=gnn_ckpt, freeze_gnn=FREEZE_GNN, use_xattn=USE_XATTN
 ).to(DEVICE)
 
-opt = torch.optim.AdamW(model.parameters(), lr=LR)
-target_weights = compute_class_weights(target_counts, NUM_T)
-direction_weights = compute_class_weights(direction_counts, NUM_D)
-crit_t = torch.nn.CrossEntropyLoss(weight=target_weights)
-crit_d = torch.nn.CrossEntropyLoss(weight=direction_weights)
+# -------------------- OPTIM + SCHED --------------------
+opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+total_steps = max(1, EPOCHS * len(train_loader))
+sched = build_scheduler(opt, total_steps, WARMUP_FRAC, LR_MIN, LR)
 
-opt = torch.optim.AdamW(model.parameters(), lr=LR)
-loss_config = {
-    "type": "focal",
-    "gamma": 2.0
-} ### loss_config = {"type": "cross_entropy"}
-target_weights = compute_class_weights(target_counts, NUM_T)
-direction_weights = compute_class_weights(direction_counts, NUM_D)
-gamma = loss_config["gamma"] if loss_config["type"] == "focal" else None
-crit_t = get_loss(
-    loss_type=loss_config["type"],
-    weight=target_weights.to(DEVICE),
-    gamma=gamma
-)
-crit_d = get_loss(
-    loss_type=loss_config["type"],
-    weight=direction_weights.to(DEVICE),
-    gamma=gamma
-)
+# -------------------- LOSSES --------------------
+crit_t = make_loss(loss_kind, weight=cw_t, gamma=FOCAL_GAMMA)
+crit_d = make_loss(loss_kind, weight=cw_d, gamma=FOCAL_GAMMA)
 
-def count_trainable_params(model):
-    total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log(f"[PARAMS] Total trainable: {total:,}")
-    return total
+log(f"[PARAMS] Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+log(f"[LOSS] kind={loss_kind} gamma={FOCAL_GAMMA} λ_t={LAMBDA_T} λ_d={LAMBDA_D}")
 
-count_trainable_params(model)
-
-best_f1 = 0
-best_epoch = -1
-# -------------------- TRAINING LOOP --------------------
+# -------------------- TRAIN --------------------
+global_step = 0
 for epoch in range(EPOCHS):
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     for batch_idx, batch in enumerate(train_loader):
-        p_vec = batch["protein_embeddings"]  # (B, 768)
-        d_vec = batch["drug_graphs"]         # PyG Batch object
-        y_t   = batch["target_ids"]          # (B,)
-        y_d   = batch["direction_ids"]       # (B,)
-        p_vec, d_vec = p_vec.to(DEVICE), d_vec.to(DEVICE)
-        y_t, y_d = y_t.to(DEVICE), y_d.to(DEVICE)
-        opt.zero_grad()
-        logit_t, logit_d = model(p_vec, d_vec)
-        loss_t = crit_t(logit_t, y_t)
-        loss_d = crit_d(logit_d, y_d)
-        loss = loss_t + loss_d
-        if batch_idx % 100 == 0:
-            log(f"[E{epoch+1} B{batch_idx}] Loss_t: {loss_t.item():.4f}, "
-                f"Loss_d: {loss_d.item():.4f}, Total: {loss.item():.4f}")
+        p, d = batch["protein_embeddings"].to(DEVICE), batch["drug_graphs"].to(DEVICE)
+        y_t, y_d = batch["target_ids"].to(DEVICE), batch["direction_ids"].to(DEVICE)
+
+        opt.zero_grad(set_to_none=True)
+        logit_t, logit_d = model(p, d)
+        loss = LAMBDA_T * crit_t(logit_t, y_t) + LAMBDA_D * crit_d(logit_d, y_d)
         loss.backward()
         opt.step()
+        sched.step()
         total_loss += loss.item()
-    avg_loss = total_loss / len(train_loader)
-    print(f"\n[EPOCH {epoch+1}/{EPOCHS}] Loss: {avg_loss:.4f}")
-    report_t, report_d = evaluate(val_loader)
-    print("Target Head Report:\n", report_t)
-    print("Direction Head Report:\n", report_d)
-# ---------------------------------------------------------
+
+        if batch_idx % 100 == 0:
+            for i, pg in enumerate(opt.param_groups):
+                if "lr" in pg: cur_lr = pg["lr"]; break
+            log(f"[E{epoch+1} B{batch_idx}] lr={cur_lr:.3e} "
+                f"Loss_t={crit_t(logit_t, y_t).item():.4f} "
+                f"Loss_d={crit_d(logit_d, y_d).item():.4f} Total={loss.item():.4f}")
+        global_step += 1
+
+    log(f"[EPOCH {epoch+1}/{EPOCHS}] AvgLoss={total_loss/len(train_loader):.4f}")
+    rt, rd = evaluate(model, val_loader, DEVICE, list(target2id.keys()), list(direction2id.keys()))
+    print("Target Report:\n", rt)
+    print("Direction Report:\n", rd)
