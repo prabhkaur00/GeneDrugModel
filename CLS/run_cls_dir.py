@@ -5,17 +5,17 @@ import pandas as pd
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from loader import ProteinDrugInteractionDataset, collate_fn
+from loader_simple import ProteinDrugInteractionDataset, collate_fn
 from model import ExpressionDirectionClassifier  # from your refactor
 
-CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/cls/direction_cls.csv")
-LMDB_PATH   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/lmdb_parts")
+CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/5k/simple-cls/direction_cls.csv")
+LMDB_PATH   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/mean-pooled-all.lmdb")
 DRUG_CACHE  = os.getenv("DRUG_CACHE", "/mnt/data/graph_cache.pkl")
 GNN         = os.getenv("GNN", "gin")
 USE_XATTN   = os.getenv("USE_XATTN", "false").lower() == "true"
 FREEZE_GNN  = os.getenv("FREEZE_GNN", "true").lower() == "true"
 BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 128))
-EPOCHS      = int(os.getenv("EPOCHS", 8))
+EPOCHS      = int(os.getenv("EPOCHS", 20))
 LR          = float(os.getenv("LR", 3e-4))
 WEIGHT_DECAY= float(os.getenv("WEIGHT_DECAY", 0.01))
 VAL_FRACTION= float(os.getenv("VAL_FRACTION", 0.2))
@@ -35,7 +35,7 @@ with open(DRUG_CACHE, "rb") as f:
     graph_cache = pickle.load(f)
 
 dataset = ProteinDrugInteractionDataset(
-    df, LMDB_PATH, graph_cache, gid2lmdb_json="/mnt/data/geneid_to_lmdb.json"
+    df, LMDB_PATH, graph_cache,
 )
 
 idx = np.arange(len(dataset))
@@ -49,6 +49,13 @@ val_set   = Subset(dataset, val_idx) if n_val>0 else None
 
 train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
                           num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
+# sanity check one batch
+b = next(iter(train_loader))
+assert b["protein_embeddings"].ndim == 2 and b["protein_embeddings"].shape[1] == 768
+print("batch protein shape:", tuple(b["protein_embeddings"].shape))
+print("batch drug graphs:", b["drug_graphs"])
+print("batch labels (dir):", b["direction_ids"].unique(sorted=True))
+
 val_loader = None if val_set is None else DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
 
