@@ -75,17 +75,24 @@ class DrugGeneEncoder(nn.Module):
         )
 
     def _node_embeddings(self, batch):
-        if hasattr(self.gnn, "get_node_embeddings"):
-            node_h = self.gnn.get_node_embeddings(batch)
-        elif hasattr(self.gnn, "forward_node_embeddings"):
-            node_h = self.gnn.forward_node_embeddings(batch)
-        elif hasattr(self.gnn, "forward") and getattr(self.gnn, "graph_pooling", None) is None:
-            node_h = self.gnn(batch)
+        out = self.gnn(batch)
+        if isinstance(out, torch.Tensor):
+            node_h, bvec = out, batch.batch
+        elif isinstance(out, tuple):
+            first = out[0]
+            if isinstance(first, torch.Tensor):
+                node_h, bvec = first, batch.batch
+            elif isinstance(first, tuple):
+                node_h, bvec = first[0], first[1] if len(first) > 1 else batch.batch
+            else:
+                raise TypeError(f"Unexpected GNN output: {type(first)}")
         else:
-            raise RuntimeError("GNN must expose per-node embeddings. Provide a method or set graph_pooling=None.")
-        d_seq, valid = to_dense_batch(node_h, batch.batch)
+            raise TypeError(f"Unexpected GNN output: {type(out)}")
+
+        d_seq, valid = to_dense_batch(node_h, bvec)
         d_pad = ~valid
         return d_seq, d_pad
+
 
     def _infer_pad_from_zero(self, p_seq):
         return (p_seq.abs().sum(dim=-1) == 0)

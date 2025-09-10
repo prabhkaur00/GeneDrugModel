@@ -6,11 +6,13 @@ import torch, torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import roc_auc_score, average_precision_score
 import optuna
-
+from gnn import GNN_graphpred
 from loader_simple import ProteinDrugInteractionDataset, collate_fn
 from model_simple import ExpressionDirectionClassifier
 
-CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/5k/simple-cls/direction_cls.csv")
+### Simple model since we use mean-pooled gene embeddings
+
+CSV_PATH    = os.getenv("CSV_PATH", "../Data/direction_cls.csv")
 LMDB_PATH   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/mean-pooled-all.lmdb")
 DRUG_CACHE  = os.getenv("DRUG_CACHE", "/mnt/data/graph_cache.pkl")
 GNN         = os.getenv("GNN", "gin")
@@ -58,10 +60,12 @@ def run_once(lr, weight_decay, batch_size, use_xattn, freeze_gnn, gnn, save_dir,
     val_loader = None if val_set is None else DataLoader(val_set, batch_size=batch_size, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
 
-    gnn_ckpt_local = '/mnt/data/gcn_contextpred.pth' if gnn=="gcn" else '/mnt/data/gin_contextpred.pth'
+    gnn_ckpt_local = '/mnt/data/gcn_contextpred.pth' if GNN=="gcn" else '/mnt/data/gin_contextpred.pth'
+    gnn_model = GNN_graphpred(5, 300, 300, graph_pooling="attention", gnn_type=GNN)
     model = ExpressionDirectionClassifier(
-        dim_p=768, emb_dim=300, d_model=512, gnn_ckpt=gnn_ckpt_local,
-        freeze_gnn=freeze_gnn, gnn_type=gnn, use_xattn=use_xattn, n_classes=2
+        dim_p=768, emb_dim=300, d_model=512,
+        gnn=gnn_model,
+        gnn_ckpt=gnn_ckpt_local, freeze_gnn=FREEZE_GNN, use_xattn=USE_XATTN, n_classes=2
     ).to(DEVICE)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
