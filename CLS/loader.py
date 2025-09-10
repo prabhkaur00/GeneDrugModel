@@ -1,11 +1,12 @@
 import os, io, json
 from glob import glob
-from typing import Dict
+from typing import Dict, List, Tuple, Any
 import lmdb
 import numpy as np
 import torch
+from torch import Tensor
 from torch.utils.data import Dataset
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch as PyGBatch
 
 def _to_gene_key(v):
     # Normalize CSV values like "1234.0" → "1234"
@@ -14,15 +15,51 @@ def _to_gene_key(v):
     except Exception:
         return str(v)
 
+def _pad_stack(seq_list: List[Tensor]) -> Tuple[Tensor, Tensor]:
+    """
+    Pad a list of [Ti, dim] DNA embedding tensors into:
+      - batch: [B, Tmax, dim] (zero-padded)
+      - mask : [B, Tmax] (True = PAD)
+    """
+    if len(seq_list) == 0:
+        raise ValueError("Empty sequence list passed to _pad_stack.")
+    B = len(seq_list)
+    dims = [x.dim() for x in seq_list]
+    if not all(d in (1, 2) for d in dims):
+        raise ValueError("All DNA embeddings must be rank-1 ([dim]) or rank-2 ([T, dim]).")
+
+    # Coerce any [dim] vectors to [1, dim] so we can treat them as 1-token sequences
+    normed = [x.unsqueeze(0) if x.dim() == 1 else x for x in seq_list]  # each: [Ti, dim]
+    T = max(x.size(0) for x in normed)
+    d = normed[0].size(1)
+
+    batch = normed[0].new_zeros((B, T, d))           # zero-pad
+    mask  = torch.ones(B, T, dtype=torch.bool)       # True=PAD
+    for i, x in enumerate(normed):
+        t = x.size(0)
+        batch[i, :t] = x
+        mask[i, :t]  = False
+    return batch, mask
+
 class ProteinDrugInteractionDataset(Dataset):
     """
-    Loads protein embeddings from multiple LMDB shards using a precomputed
+    Loads DNA (formerly 'protein') embeddings from multiple LMDB shards using a precomputed
     gene_id -> lmdb_path mapping (geneid_to_lmdb.json). Avoids any DB scans.
+
+    Returns per-item:
+        {
+          "dna": Tensor [T, dim] or [dim] (auto-handled in collate),
+          "drug": PyG Data,
+          "target_id": int,         # kept for compatibility (unused in direction-only runs)
+          "direction_id": int,      # label for direction (binary)
+          "row_idx": int,
+          "seg_idx": int,
+        }
     """
     def __init__(
         self,
         seg_df,
-        protein_lmdb_dir: str,
+        dna_lmdb_dir: str,                           # renamed from protein_lmdb_dir
         smiles_cache: Dict[str, "torch_geometric.data.Data"],
         gid2lmdb_json: str,
         verify_keys: bool = False,
@@ -31,13 +68,12 @@ class ProteinDrugInteractionDataset(Dataset):
         self.df = seg_df.reset_index(drop=True)
         self.smiles_cache = smiles_cache
 
-        # Load mapping and normalize to absolute paths under protein_lmdb_dir
+        # Load mapping and normalize to absolute paths under dna_lmdb_dir
         with open(gid2lmdb_json) as f:
             raw_map = json.load(f)
 
-        # Some mappings might be absolute already; normalize relative to dir if needed
         def _normalize_path(p):
-            return p if os.path.isabs(p) else os.path.abspath(os.path.join(protein_lmdb_dir, p))
+            return p if os.path.isabs(p) else os.path.abspath(os.path.join(dna_lmdb_dir, p))
 
         self.gid2path = { _to_gene_key(g): _normalize_path(p) for g, p in raw_map.items() }
 
@@ -56,7 +92,7 @@ class ProteinDrugInteractionDataset(Dataset):
         # Open only required LMDB envs (readonly, no locks)
         self.env_by_path = {}
         for p in self.paths_needed:
-            # subdir=False because your shards are *.lmdb files (not directories)
+            # subdir=False because shards are *.lmdb files (not directories)
             env = lmdb.open(p, readonly=True, lock=False, subdir=False, readahead=True, max_readers=512)
             self.env_by_path[p] = env
 
@@ -115,7 +151,6 @@ class ProteinDrugInteractionDataset(Dataset):
 
         env = self.env_by_path.get(lmdb_path, None)
         if env is None:
-            # Should not happen if paths were filtered; open on the fly as a fallback
             env = lmdb.open(lmdb_path, readonly=True, lock=False, subdir=False, readahead=True, max_readers=512)
             self.env_by_path[lmdb_path] = env
 
@@ -124,36 +159,50 @@ class ProteinDrugInteractionDataset(Dataset):
             buf = txn.get(key)
             if buf is None:
                 raise KeyError(f"gene_id {gid} not found in LMDB {lmdb_path}")
-            protein_embedding = np.load(io.BytesIO(bytes(buf)), allow_pickle=False)
-            protein_embedding = torch.tensor(protein_embedding, dtype=torch.float32)
+            dna_embedding = np.load(io.BytesIO(bytes(buf)), allow_pickle=False)
+            dna_embedding = torch.tensor(dna_embedding, dtype=torch.float32)
+            # Supports either [dim] (legacy) or [T, dim] (token sequence)
+            if dna_embedding.dim() == 1:
+                # treat as 1-token sequence to keep the new model happy
+                dna_embedding = dna_embedding.unsqueeze(0)
 
         drug_graph = self.smiles_cache[smi]
 
         return {
-            "protein": protein_embedding,                     # (768,)
-            "drug":    drug_graph,                            # PyG Data
-            "target_id":    int(row["target_id"]),
+            "dna": dna_embedding,                     # [T, dim] (or [1, dim] if legacy)
+            "drug": drug_graph,                       # PyG Data
+            "target_id":    int(row.get("target_id", -1)),  # optional / unused in direction-only runs
             "direction_id": int(row["direction_id"]),
             "row_idx": int(row.get("row_idx", -1)),
             "seg_idx": int(row.get("seg_idx", 0)),
         }
 
-def collate_fn(batch):
+def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch = [b for b in batch if b is not None]
     if not batch:
         raise ValueError("All items in batch are None")
 
-    protein_embeddings = torch.stack([b["protein"] for b in batch])  # (B, 768)
-    drug_graphs = Batch.from_data_list([b["drug"] for b in batch])
+    # --- DNA embeddings: list of [Ti, dim] → [B, T, dim] + mask [B, T] ---
+    dna_list: List[Tensor] = [b["dna"] for b in batch]
+    dna_embeddings, dna_mask = _pad_stack(dna_list)   # zero-padded
 
-    target_ids    = torch.tensor([b["target_id"] for b in batch], dtype=torch.long)
+    # --- Drug graphs: to PyG Batch ---
+    drug_graphs = PyGBatch.from_data_list([b["drug"] for b in batch])
+
+    # --- Labels ---
     direction_ids = torch.tensor([b["direction_id"] for b in batch], dtype=torch.long)
+    # Keep target_ids for compatibility if present (not used in direction-only run)
+    if "target_id" in batch[0]:
+        target_ids = torch.tensor([b.get("target_id", -1) for b in batch], dtype=torch.long)
+    else:
+        target_ids = torch.full((len(batch),), -1, dtype=torch.long)
 
     return {
-        "protein_embeddings": protein_embeddings,
-        "drug_graphs": drug_graphs,
-        "target_ids": target_ids,
-        "direction_ids": direction_ids,
-        "row_idxs": [b["row_idx"] for b in batch],
-        "seg_idxs": [b["seg_idx"] for b in batch],
+        "dna_embeddings": dna_embeddings,   # [B, T, dim]
+        "dna_mask": dna_mask,               # [B, T], True = PAD
+        "drug_graphs": drug_graphs,         # PyG Batch
+        "direction_ids": direction_ids,     # [B]
+        "target_ids": target_ids,           # [B] (kept for API symmetry)
+        "row_idxs": [b.get("row_idx", -1) for b in batch],
+        "seg_idxs": [b.get("seg_idx", 0) for b in batch],
     }

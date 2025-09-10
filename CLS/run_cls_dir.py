@@ -1,166 +1,121 @@
-# train_direction.py
-import os, json, time, pickle, random
-import numpy as np
-import pandas as pd
+import os, json, pickle, time
 import torch, torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+import pandas as pd
+import numpy as np
+from sklearn.metrics import classification_report, average_precision_score
+from torch.utils.data import DataLoader, random_split
 
-from loader_simple import ProteinDrugInteractionDataset, collate_fn
-from model import ExpressionDirectionClassifier  # from your refactor
-from sklearn.metrics import roc_auc_score, average_precision_score
+from loader import ProteinDrugInteractionDataset, collate_fn
+from model import ExpressionDirectionClassifier  # <-- put your model in this module/file
+from gnn import GNN_graphpred
 
-
-CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/5k/simple-cls/direction_cls.csv")
-LMDB_PATH   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/mean-pooled-all.lmdb")
-DRUG_CACHE  = os.getenv("DRUG_CACHE", "/mnt/data/graph_cache.pkl")
-GNN         = os.getenv("GNN", "gin")
-USE_XATTN   = os.getenv("USE_XATTN", "false").lower() == "true"
-FREEZE_GNN  = os.getenv("FREEZE_GNN", "true").lower() == "true"
-BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 128))
-EPOCHS      = int(os.getenv("EPOCHS", 20))
+# ---------- CONFIG ----------
+CSV_PATH    = os.getenv("CSV_PATH")                      # e.g., /.../expr_dir.csv
+BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 4))
+EPOCHS      = int(os.getenv("EPOCHS", 50))
 LR          = float(os.getenv("LR", 3e-4))
 WEIGHT_DECAY= float(os.getenv("WEIGHT_DECAY", 0.01))
-VAL_FRACTION= float(os.getenv("VAL_FRACTION", 0.2))
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 0))
-SAVE_DIR    = os.getenv("SAVE_DIR", "/mnt/data/cls/runs/direction")
-SEED        = int(os.getenv("SEED", 42))
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-gnn_ckpt    = '/mnt/data/gcn_contextpred.pth' if GNN=="gcn" else '/mnt/data/gin_contextpred.pth'
 
-os.makedirs(SAVE_DIR, exist_ok=True)
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+LMDB_PATH   = os.getenv("LMDB_PATH",   "/mnt/data/gene_data/lmdb_parts")
+DRUG_CACHE  = os.getenv("DRUG_CACHE",  "/mnt/data/graph_cache.pkl")
+GID2LMDB_JSON = os.getenv("GID2LMDB_JSON", "/mnt/data/geneid_to_lmdb.json")
 
-df = pd.read_csv(CSV_PATH)
-df = df[(df["target_id"] == 0) & (df["direction_id"].isin([0,1]))].reset_index(drop=True)
+USE_XATTN   = os.getenv("USE_XATTN", "true").lower() == "true"
+FREEZE_GNN  = os.getenv("FREEZE_GNN","true").lower() == "true"
+GNN         = os.getenv("GNN", "gin")                    # 'gcn' or 'gin'
+GNN_CKPT    = '/mnt/data/gcn_contextpred.pth' if GNN=="gcn" else '/mnt/data/gin_contextpred.pth'
 
-with open(DRUG_CACHE, "rb") as f:
-    graph_cache = pickle.load(f)
+DIM_P       = int(os.getenv("DIM_P", 768))               # gene/DNA embedding dim
+EMB_DIM     = int(os.getenv("EMB_DIM", 300))             # drug GNN hidden dim
+D_MODEL     = int(os.getenv("D_MODEL", 512))
+N_CLASSES   = 2                                          # binary direction
 
-dataset = ProteinDrugInteractionDataset(
-    df, LMDB_PATH, graph_cache,
-)
 
-idx = np.arange(len(dataset))
-np.random.shuffle(idx)
-n_val = int(len(idx)*VAL_FRACTION)
-val_idx = idx[:n_val] if n_val>0 else []
-train_idx = idx[n_val:] if n_val>0 else idx
+# ---------- EVAL (direction only) ----------
+def eval_reports_direction(model, loader, device):
+    model.eval()
+    y_true, y_prob = [], []
+    with torch.no_grad():
+        for b in loader:
+            p = b["protein_embeddings"].to(device)  # [B, DIM_P]
+            d = b["drug_graphs"].to(device)         # PyG Batch
+            y = b["direction_ids"].to(device)       # {0,1}
+            ld = model(p, d)                        # [B,2] logits
+            prob_pos = ld.softmax(-1)[:, 1]
+            y_true.extend(y.cpu().tolist())
+            y_prob.extend(prob_pos.cpu().tolist())
+    y_true = np.array(y_true)
+    y_pred = (np.array(y_prob) >= 0.5).astype(int)
+    pr_auc = average_precision_score(y_true, y_prob)
+    rpt = classification_report(y_true, y_pred, target_names=["neg","pos"], zero_division=0)
+    return pr_auc, rpt
 
-train_set = Subset(dataset, train_idx)
-val_set   = Subset(dataset, val_idx) if n_val>0 else None
 
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
-                          num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
-# sanity check one batch
-b = next(iter(train_loader))
-assert b["protein_embeddings"].ndim == 2 and b["protein_embeddings"].shape[1] == 768
-print("batch protein shape:", tuple(b["protein_embeddings"].shape))
-print("batch drug graphs:", b["drug_graphs"])
-print("batch labels (dir):", b["direction_ids"].unique(sorted=True))
+# ---------- MAIN ----------
+def main():
+    df = pd.read_csv(CSV_PATH)
+    with open(DRUG_CACHE, "rb") as f:
+        graph_cache = pickle.load(f)
 
-val_loader = None if val_set is None else DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
+    full_set = ProteinDrugInteractionDataset(
+        df, LMDB_PATH, graph_cache, gid2lmdb_json=GID2LMDB_JSON
+    )
 
-model = ExpressionDirectionClassifier(
-    dim_p=768, emb_dim=300, d_model=512, gnn_ckpt=gnn_ckpt,
-    freeze_gnn=FREEZE_GNN, gnn_type=GNN, use_xattn=USE_XATTN, n_classes=2
-).to(DEVICE)
+    # 80/10/10 random split
+    n_total = len(full_set)
+    n_train = int(0.8 * n_total)
+    n_val   = int(0.1 * n_total)
+    n_test  = n_total - n_train - n_val
+    train_set, val_set, test_set = random_split(full_set, [n_train, n_val, n_test])
 
-opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-crit = nn.CrossEntropyLoss()
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
+    val_loader   = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
+    test_loader  = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
+    gnn = GNN_graphpred(5, EMB_DIM, EMB_DIM, graph_pooling=None, gnn_type='gin')
+    model = ExpressionDirectionClassifier(
+        dim_p=DIM_P, emb_dim=EMB_DIM, d_model=D_MODEL,
+        gnn=gnn,
+        gnn_ckpt=GNN_CKPT, freeze_gnn=FREEZE_GNN, use_xattn=USE_XATTN, n_classes=N_CLASSES
+    ).to(DEVICE)
 
-run_cfg = {
-    "task":"direction_cls",
-    "csv":CSV_PATH,
-    "samples_total":len(dataset),
-    "train":len(train_set),
-    "val":len(val_set) if val_set else 0,
-    "batch_size":BATCH_SIZE,
-    "epochs":EPOCHS,
-    "lr":LR,
-    "weight_decay":WEIGHT_DECAY,
-    "use_xattn":USE_XATTN,
-    "freeze_gnn":FREEZE_GNN,
-    "gnn":GNN,
-    "seed":SEED,
-    "device":str(DEVICE)
-}
-print("[CONFIG]", json.dumps(run_cfg, indent=2))
-best_val = float("inf"); best_state=None
-for ep in range(1, EPOCHS+1):
-    model.train()
-    t0 = time.time()
-    tot=0.0; nb=0
-    tr_probs=[]; tr_tgts=[]
-    for b in train_loader:
-        p = b["protein_embeddings"].to(DEVICE)
-        d = b["drug_graphs"].to(DEVICE)
-        y = b["direction_ids"].to(DEVICE)
-        opt.zero_grad(set_to_none=True)
-        logits = model(p, d)
-        loss = crit(logits, y)
-        loss.backward(); opt.step()
-        tot += loss.item(); nb += 1
-        tr_probs.append(torch.softmax(logits, dim=1)[:, 1].detach().cpu())
-        tr_tgts.append(y.detach().cpu())
-    train_loss = tot/max(1,nb)
-    yt = torch.cat(tr_tgts).numpy()
-    pt = torch.cat(tr_probs).numpy()
-    try:
-        train_auroc = roc_auc_score(yt, pt)
-    except Exception:
-        train_auroc = float("nan")
-    try:
-        train_auprc = average_precision_score(yt, pt)
-    except Exception:
-        train_auprc = float("nan")
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    crit = nn.CrossEntropyLoss()
 
-    if val_loader is not None:
-        model.eval()
-        vtot=0.0; vnb=0
-        vl_probs=[]; vl_tgts=[]
-        with torch.no_grad():
-            for b in val_loader:
-                p = b["protein_embeddings"].to(DEVICE)
-                d = b["drug_graphs"].to(DEVICE)
-                y = b["direction_ids"].to(DEVICE)
-                logits = model(p, d)
-                loss = crit(logits, y)
-                vtot += loss.item(); vnb += 1
-                vl_probs.append(torch.softmax(logits, dim=1)[:, 1].cpu())
-                vl_tgts.append(y.cpu())
-        val_loss = vtot/max(1,vnb)
-        yv = torch.cat(vl_tgts).numpy()
-        pv = torch.cat(vl_probs).numpy()
-        try:
-            val_auroc = roc_auc_score(yv, pv)
-        except Exception:
-            val_auroc = float("nan")
-        try:
-            val_auprc = average_precision_score(yv, pv)
-        except Exception:
-            val_auprc = float("nan")
-    else:
-        val_loss = train_loss
-        val_auroc = float("nan")
-        val_auprc = float("nan")
+    print(f"[run] n={n_total} | train={n_train} val={n_val} test={n_test} | lr={LR} | xattn={USE_XATTN} | gnn={GNN}")
 
-    dt = time.time()-t0
-    print(f"[E{ep}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-          f"train_auroc={train_auroc:.4f} train_auprc={train_auprc:.4f} "
-          f"val_auroc={val_auroc:.4f} val_auprc={val_auprc:.4f} time_s={dt:.1f}")
+    best = -1.0; best_state = None
+    for ep in range(1, EPOCHS+1):
+        model.train(); total = 0.0
+        for b in train_loader:
+            p = b["dna_embeddings"].to(DEVICE)   # [B, T, dim]
+            pm = b["dna_mask"].to(DEVICE)        # [B, T] (True=PAD)
+            d = b["drug_graphs"].to(DEVICE)
 
-    if val_loss < best_val:
-        best_val = val_loss
-        best_state = {k: v.detach().cpu() for k,v in model.state_dict().items()}
+            y = b["direction_ids"].to(DEVICE)       # {0,1}
 
-if best_state is not None:
-    model.load_state_dict(best_state)
+            opt.zero_grad(set_to_none=True)
+            ld = model(p, d, p_pad=pm)                         # [B,2]
+            loss = crit(ld, y)
+            loss.backward(); opt.step()
+            total += loss.item()
 
-ckpt_path = os.path.join(SAVE_DIR, "model.pt")
-torch.save(model.state_dict(), ckpt_path)
+        pr_auc, rpt = eval_reports_direction(model, val_loader, DEVICE)
+        print(f"[E{ep}] loss={total/len(train_loader):.4f} | val_PR-AUC={pr_auc:.4f}")
+        if pr_auc > best:
+            best = pr_auc
+            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
 
-with open(os.path.join(SAVE_DIR, "run.json"), "w") as f:
-    json.dump({**run_cfg, "best_val_loss": float(best_val)}, f, indent=2)
+    # test
+    if best_state: model.load_state_dict(best_state)
+    pr_auc, rpt = eval_reports_direction(model, test_loader, DEVICE)
+    print("\n[TEST] PR-AUC:", f"{pr_auc:.4f}")
+    print("[TEST] Report:\n", rpt)
 
-print("[SAVED]", ckpt_path)
+
+if __name__ == "__main__":
+    main()

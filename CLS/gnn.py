@@ -359,7 +359,7 @@ class GNN_graphpred(torch.nn.Module):
         self.JK = JK
         self.emb_dim = emb_dim
         self.num_tasks = num_tasks
-        self.pool = pool
+        self.pool = None
 
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
@@ -378,25 +378,28 @@ class GNN_graphpred(torch.nn.Module):
                 self.pool = GlobalAttention(gate_nn = torch.nn.Linear((self.num_layer + 1) * emb_dim, 1))
             else:
                 self.pool = GlobalAttention(gate_nn = torch.nn.Linear(emb_dim, 1))
-        elif graph_pooling[:-1] == "set2set":
+        elif isinstance(graph_pooling, str) and graph_pooling[:-1] == "set2set":
             set2set_iter = int(graph_pooling[-1])
             if self.JK == "concat":
                 self.pool = Set2Set((self.num_layer + 1) * emb_dim, set2set_iter)
             else:
                 self.pool = Set2Set(emb_dim, set2set_iter)
+        elif graph_pooling in ["none", None]:
+            # No graph pooling: expose per-node embeddings to the caller
+            self.pool = None
         else:
             raise ValueError("Invalid graph pooling type.")
 
         #For graph-level binary classification
-        if graph_pooling[:-1] == "set2set":
-            self.mult = 2
-        else:
-            self.mult = 1
+        self.mult = 2 if isinstance(self.pool, Set2Set) else 1
 
-        if self.JK == "concat":
-            self.graph_pred_linear = torch.nn.Linear(self.mult * (self.num_layer + 1) * self.emb_dim, self.num_tasks)
+        if self.pool is None:
+            self.graph_pred_linear = None
         else:
-            self.graph_pred_linear = torch.nn.Linear(self.mult * self.emb_dim, self.num_tasks)
+            if self.JK == "concat":
+                self.graph_pred_linear = torch.nn.Linear(self.mult * (self.num_layer + 1) * self.emb_dim, self.num_tasks)
+            else:
+                self.graph_pred_linear = torch.nn.Linear(self.mult * self.emb_dim, self.num_tasks)
 
     def from_pretrained(self, model_file):
         #self.gnn = GNN(self.num_layer, self.emb_dim, JK = self.JK, drop_ratio = self.drop_ratio)
@@ -429,7 +432,7 @@ class GNN_graphpred(torch.nn.Module):
 
         node_representation = self.gnn(x, edge_index, edge_attr)
 
-        if self.pool:
+        if self.pool is not None:
             # token/atom-level embeddings + the batch vector so you can unbatch/pad
             return self.graph_pred_linear(self.pool(node_representation, batch))
         
