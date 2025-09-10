@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader, Subset
 
 from loader_simple import ProteinDrugInteractionDataset, collate_fn
 from model import ExpressionDirectionClassifier  # from your refactor
+from sklearn.metrics import roc_auc_score, average_precision_score
+
 
 CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/5k/simple-cls/direction_cls.csv")
 LMDB_PATH   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/mean-pooled-all.lmdb")
@@ -84,12 +86,12 @@ run_cfg = {
     "device":str(DEVICE)
 }
 print("[CONFIG]", json.dumps(run_cfg, indent=2))
-
 best_val = float("inf"); best_state=None
 for ep in range(1, EPOCHS+1):
     model.train()
     t0 = time.time()
     tot=0.0; nb=0
+    tr_probs=[]; tr_tgts=[]
     for b in train_loader:
         p = b["protein_embeddings"].to(DEVICE)
         d = b["drug_graphs"].to(DEVICE)
@@ -99,11 +101,24 @@ for ep in range(1, EPOCHS+1):
         loss = crit(logits, y)
         loss.backward(); opt.step()
         tot += loss.item(); nb += 1
+        tr_probs.append(torch.softmax(logits, dim=1)[:, 1].detach().cpu())
+        tr_tgts.append(y.detach().cpu())
     train_loss = tot/max(1,nb)
+    yt = torch.cat(tr_tgts).numpy()
+    pt = torch.cat(tr_probs).numpy()
+    try:
+        train_auroc = roc_auc_score(yt, pt)
+    except Exception:
+        train_auroc = float("nan")
+    try:
+        train_auprc = average_precision_score(yt, pt)
+    except Exception:
+        train_auprc = float("nan")
 
     if val_loader is not None:
         model.eval()
         vtot=0.0; vnb=0
+        vl_probs=[]; vl_tgts=[]
         with torch.no_grad():
             for b in val_loader:
                 p = b["protein_embeddings"].to(DEVICE)
@@ -112,12 +127,28 @@ for ep in range(1, EPOCHS+1):
                 logits = model(p, d)
                 loss = crit(logits, y)
                 vtot += loss.item(); vnb += 1
+                vl_probs.append(torch.softmax(logits, dim=1)[:, 1].cpu())
+                vl_tgts.append(y.cpu())
         val_loss = vtot/max(1,vnb)
+        yv = torch.cat(vl_tgts).numpy()
+        pv = torch.cat(vl_probs).numpy()
+        try:
+            val_auroc = roc_auc_score(yv, pv)
+        except Exception:
+            val_auroc = float("nan")
+        try:
+            val_auprc = average_precision_score(yv, pv)
+        except Exception:
+            val_auprc = float("nan")
     else:
         val_loss = train_loss
+        val_auroc = float("nan")
+        val_auprc = float("nan")
 
     dt = time.time()-t0
-    print(f"[E{ep}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} time_s={dt:.1f}")
+    print(f"[E{ep}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+          f"train_auroc={train_auroc:.4f} train_auprc={train_auprc:.4f} "
+          f"val_auroc={val_auroc:.4f} val_auprc={val_auprc:.4f} time_s={dt:.1f}")
 
     if val_loss < best_val:
         best_val = val_loss
