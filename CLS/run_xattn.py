@@ -5,11 +5,12 @@ import pandas as pd
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from loader_simple import ProteinDrugInteractionDataset, collate_fn
-from model import ExpressionDirectionClassifier  # from your refactor
+from loader_xattn import ProteinDrugInteractionDataset, collate_fn
+from model_xattn import ExpressionDirectionClassifier  # from your refactor
 
 CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/5k/simple-cls/direction_cls.csv")
-LMDB_PATH   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/mean-pooled-all.lmdb")
+LMDB_DIR   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/lmdb_parts")
+GENE_TO_LMDB_JSON = os.getenv("GENE_TO_LMDB_JSON", "/mnt/data/geneid_to_lmdb.json")
 DRUG_CACHE  = os.getenv("DRUG_CACHE", "/mnt/data/graph_cache.pkl")
 GNN         = os.getenv("GNN", "gin")
 USE_XATTN   = os.getenv("USE_XATTN", "false").lower() == "true"
@@ -24,6 +25,9 @@ SAVE_DIR    = os.getenv("SAVE_DIR", "/mnt/data/cls/runs/direction")
 SEED        = int(os.getenv("SEED", 42))
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gnn_ckpt    = '/mnt/data/gcn_contextpred.pth' if GNN=="gcn" else '/mnt/data/gin_contextpred.pth'
+RETURN_SEQS = os.getenv("RETURN_SEQUENCES", "true").lower() == "true"   # use full sequences
+GENE_POOL_F = int(os.getenv("GENE_POOL_FACTOR", 8))                      # 8× sliding window for gene
+MAX_NODES   = int(os.getenv("MAX_NODES", 50))
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
@@ -35,7 +39,7 @@ with open(DRUG_CACHE, "rb") as f:
     graph_cache = pickle.load(f)
 
 dataset = ProteinDrugInteractionDataset(
-    df, LMDB_PATH, graph_cache,
+    df, LMDB_DIR, GENE_TO_LMDB_JSON, graph_cache,
 )
 
 idx = np.arange(len(dataset))
@@ -51,9 +55,10 @@ train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
                           num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
 # sanity check one batch
 b = next(iter(train_loader))
-assert b["protein_embeddings"].ndim == 2 and b["protein_embeddings"].shape[1] == 768
-print("batch protein shape:", tuple(b["protein_embeddings"].shape))
-print("batch drug graphs:", b["drug_graphs"])
+pe = b["protein_embeddings"]
+assert pe.shape[-1] == 768, "expected last dim 768 for gene embeddings"
+print("batch protein shape:", tuple(pe.shape))  # e.g., [B, T, 768] for sequences
+print("batch drug graphs:", b["drug_graphs"])   # PyG Batch
 print("batch labels (dir):", b["direction_ids"].unique(sorted=True))
 
 val_loader = None if val_set is None else DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
@@ -67,22 +72,27 @@ model = ExpressionDirectionClassifier(
 opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 crit = nn.CrossEntropyLoss()
 
+model = ExpressionDirectionClassifier(
+    dim_p=768,
+    emb_dim=300,
+    d_model=512,
+    gnn_ckpt=gnn_ckpt,
+    freeze_gnn=FREEZE_GNN,
+    gnn_type=GNN,
+    use_xattn=USE_XATTN,
+    n_classes=2,
+    return_sequences=RETURN_SEQS,     # <- enable full sequences path
+).to(DEVICE)
 run_cfg = {
-    "task":"direction_cls",
-    "csv":CSV_PATH,
-    "samples_total":len(dataset),
-    "train":len(train_set),
-    "val":len(val_set) if val_set else 0,
-    "batch_size":BATCH_SIZE,
-    "epochs":EPOCHS,
-    "lr":LR,
-    "weight_decay":WEIGHT_DECAY,
-    "use_xattn":USE_XATTN,
-    "freeze_gnn":FREEZE_GNN,
-    "gnn":GNN,
     "seed":SEED,
     "device":str(DEVICE)
 }
+
+run_cfg.update({
+    "return_sequences": RETURN_SEQS,
+    "gene_pool_factor": GENE_POOL_F,
+    "max_nodes": MAX_NODES,
+})
 print("[CONFIG]", json.dumps(run_cfg, indent=2))
 
 best_val = float("inf"); best_state=None

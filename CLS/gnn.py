@@ -346,11 +346,8 @@ class GNN_graphpred(torch.nn.Module):
         num_tasks (int): number of tasks in multi-task learning scenario
         drop_ratio (float): dropout rate
         JK (str): last, concat, max or sum.
-        graph_pooling (str): sum, mean, max, attention, set2set
+        graph_pooling (str): sum, mean, max, attention, set2set, none
         gnn_type: gin, gcn, graphsage, gat
-
-    See https://arxiv.org/abs/1810.00826
-    JK-net: https://arxiv.org/abs/1806.03536
     """
     def __init__(self, num_layer, emb_dim, num_tasks, JK = "last", drop_ratio = 0, graph_pooling = "mean", gnn_type = "gin", pool=False):
         super(GNN_graphpred, self).__init__()
@@ -384,6 +381,8 @@ class GNN_graphpred(torch.nn.Module):
                 self.pool = Set2Set((self.num_layer + 1) * emb_dim, set2set_iter)
             else:
                 self.pool = Set2Set(emb_dim, set2set_iter)
+        elif graph_pooling == "none":
+            self.pool = None  # CHANGED: allow disabling pooling to return node features
         else:
             raise ValueError("Invalid graph pooling type.")
 
@@ -399,7 +398,6 @@ class GNN_graphpred(torch.nn.Module):
             self.graph_pred_linear = torch.nn.Linear(self.mult * self.emb_dim, self.num_tasks)
 
     def from_pretrained(self, model_file):
-        #self.gnn = GNN(self.num_layer, self.emb_dim, JK = self.JK, drop_ratio = self.drop_ratio)
         if os.path.isfile(model_file):
             checkpoint = torch.load(model_file, map_location="cpu")
         else:
@@ -429,9 +427,7 @@ class GNN_graphpred(torch.nn.Module):
 
         node_representation = self.gnn(x, edge_index, edge_attr)
 
-        if self.pool:
-            # token/atom-level embeddings + the batch vector so you can unbatch/pad
+        if self.pool is not None:  # CHANGED: only pool when a pooling op is configured
             return self.graph_pred_linear(self.pool(node_representation, batch))
         
-        return node_representation, batch
-
+        return node_representation, batch  # CHANGED: return node features + batch when pooling is disabled
