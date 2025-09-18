@@ -15,7 +15,7 @@ DRUG_CACHE  = os.getenv("DRUG_CACHE", "/mnt/data/graph_cache.pkl")
 GNN         = os.getenv("GNN", "gin")
 USE_XATTN   = os.getenv("USE_XATTN", "false").lower() == "true"
 FREEZE_GNN  = os.getenv("FREEZE_GNN", "true").lower() == "true"
-BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 128))
+BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 16))
 EPOCHS      = int(os.getenv("EPOCHS", 20))
 LR          = float(os.getenv("LR", 3e-4))
 WEIGHT_DECAY= float(os.getenv("WEIGHT_DECAY", 0.01))
@@ -29,6 +29,7 @@ RETURN_SEQS = os.getenv("RETURN_SEQUENCES", "true").lower() == "true"   # use fu
 GENE_POOL_F = int(os.getenv("GENE_POOL_FACTOR", 8))                      # 8× sliding window for gene
 MAX_NODES   = int(os.getenv("MAX_NODES", 50))
 
+torch.set_num_threads(1)
 os.makedirs(SAVE_DIR, exist_ok=True)
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
@@ -51,26 +52,25 @@ train_idx = idx[n_val:] if n_val>0 else idx
 train_set = Subset(dataset, train_idx)
 val_set   = Subset(dataset, val_idx) if n_val>0 else None
 
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
-                          num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
+train_loader = DataLoader(
+    train_set,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    collate_fn=collate_fn,
+    persistent_workers=(NUM_WORKERS > 0),
+    prefetch_factor=(4 if NUM_WORKERS > 0 else None),
+)
+
 # sanity check one batch
-b = next(iter(train_loader))
+sanity_loader = DataLoader(train_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=collate_fn)
+b = next(iter(sanity_loader))
 pe = b["protein_embeddings"]
-assert pe.shape[-1] == 768, "expected last dim 768 for gene embeddings"
-print("batch protein shape:", tuple(pe.shape))  # e.g., [B, T, 768] for sequences
-print("batch drug graphs:", b["drug_graphs"])   # PyG Batch
-print("batch labels (dir):", b["direction_ids"].unique(sorted=True))
+assert pe.shape[-1] == 768
 
 val_loader = None if val_set is None else DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
-
-model = ExpressionDirectionClassifier(
-    dim_p=768, emb_dim=300, d_model=512, gnn_ckpt=gnn_ckpt,
-    freeze_gnn=FREEZE_GNN, gnn_type=GNN, use_xattn=USE_XATTN, n_classes=2
-).to(DEVICE)
-
-opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-crit = nn.CrossEntropyLoss()
 
 model = ExpressionDirectionClassifier(
     dim_p=768,
@@ -83,6 +83,10 @@ model = ExpressionDirectionClassifier(
     n_classes=2,
     return_sequences=RETURN_SEQS,     # <- enable full sequences path
 ).to(DEVICE)
+
+opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+crit = nn.CrossEntropyLoss()
+
 run_cfg = {
     "seed":SEED,
     "device":str(DEVICE)

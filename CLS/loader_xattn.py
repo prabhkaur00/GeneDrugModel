@@ -86,7 +86,7 @@ class ProteinDrugInteractionDataset(Dataset):
         path = os.path.join(self.lmdb_dir, f"full_embeddings_{shard_idx}.h5.lmdb")
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-        env = lmdb.open(path, readonly=True, lock=False, subdir=False, readahead=True, max_readers=512)
+        env = lmdb.open(path, readonly=True, lock=False, subdir=False, readahead=True, max_readers=2048)
         self.envs[shard_idx] = env
         return env
 
