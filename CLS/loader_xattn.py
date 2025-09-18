@@ -58,7 +58,8 @@ class ProteinDrugInteractionDataset(Dataset):
                     missing_map += 1
                     continue
                 env = self._open_env(shard)
-                with env.begin(buffers=True) as txn:
+                # CHANGED: use buffers=False to avoid txn-backed memoryviews
+                with env.begin(buffers=False) as txn:
                     if txn.get(gid.encode("utf-8")) is None:
                         missing_key_in_env += 1
                         continue
@@ -102,11 +103,12 @@ class ProteinDrugInteractionDataset(Dataset):
         if shard is None:
             raise KeyError(f"gene_id {gid} missing in mapping")
         env = self._open_env(shard)
-        with env.begin(buffers=True) as txn:
+        # CHANGED: buffers=False so txn.get returns plain bytes (pickle-safe)
+        with env.begin(buffers=False) as txn:
             buf = txn.get(gid.encode("utf-8"))
             if buf is None:
                 raise KeyError(f"gene_id {gid} not found in shard {shard}")
-            emb = np.load(io.BytesIO(bytes(buf)), allow_pickle=False)
+            emb = np.load(io.BytesIO(buf), allow_pickle=False)  # CHANGED: buf already bytes
             protein_embedding = torch.tensor(emb, dtype=torch.float32)
         drug_graph = self.smiles_cache[smi]
         return {
@@ -117,6 +119,7 @@ class ProteinDrugInteractionDataset(Dataset):
             "row_idx": int(row.get("row_idx", -1)),
             "seg_idx": int(row.get("seg_idx", 0)),
         }
+
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
