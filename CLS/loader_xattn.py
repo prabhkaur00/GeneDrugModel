@@ -119,6 +119,17 @@ class ProteinDrugInteractionDataset(Dataset):
             "row_idx": int(row.get("row_idx", -1)),
             "seg_idx": int(row.get("seg_idx", 0)),
         }
+    
+    def __getstate__(self):
+    # Remove unpicklable LMDB environments before pickling
+        state = self.__dict__.copy()
+        state['envs'] = {}  # Clear the environments dict
+        return state
+
+    def __setstate__(self, state):
+        # Restore state and let environments be opened lazily
+        self.__dict__.update(state)
+        self.envs = {}
 
 
 def collate_fn(batch):

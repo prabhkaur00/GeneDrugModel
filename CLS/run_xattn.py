@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader, Subset
-
+import multiprocessing as mp
 from loader_xattn import ProteinDrugInteractionDataset, collate_fn
 from model_xattn import ExpressionDirectionClassifier  # from your refactor
 
@@ -69,9 +69,16 @@ b = next(iter(sanity_loader))
 pe = b["protein_embeddings"]
 assert pe.shape[-1] == 768
 
-val_loader = None if val_set is None else DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=True, collate_fn=collate_fn)
-
+val_loader = None if val_set is None else DataLoader(
+    val_set,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    collate_fn=collate_fn,
+    persistent_workers=(NUM_WORKERS > 0),
+    prefetch_factor=(4 if NUM_WORKERS > 0 else None),
+)
 model = ExpressionDirectionClassifier(
     dim_p=768,
     emb_dim=300,
