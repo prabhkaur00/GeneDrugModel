@@ -8,15 +8,14 @@ import multiprocessing as mp
 from loader_xattn import ProteinDrugInteractionDataset, collate_fn
 from model_xattn import ExpressionDirectionClassifier  # from your refactor
 
-CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/5k/simple-cls/direction_cls.csv")
-LMDB_DIR   = os.getenv("LMDB_PATH", "/mnt/data/gene_data/lmdb_parts")
-GENE_TO_LMDB_JSON = os.getenv("GENE_TO_LMDB_JSON", "/mnt/data/geneid_to_lmdb.json")
+CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/direction_lt500.csv")
+LMDB_DIR   = os.getenv("LMDB_PATH", "/mnt/data/filtered_lt500.lmdb")
 DRUG_CACHE  = os.getenv("DRUG_CACHE", "/mnt/data/graph_cache.pkl")
 GNN         = os.getenv("GNN", "gin")
 USE_XATTN   = os.getenv("USE_XATTN", "false").lower() == "true"
 FREEZE_GNN  = os.getenv("FREEZE_GNN", "true").lower() == "true"
 BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 16))
-EPOCHS      = int(os.getenv("EPOCHS", 20))
+EPOCHS      = int(os.getenv("EPOCHS", 100))
 LR          = float(os.getenv("LR", 3e-4))
 WEIGHT_DECAY= float(os.getenv("WEIGHT_DECAY", 0.01))
 VAL_FRACTION= float(os.getenv("VAL_FRACTION", 0.2))
@@ -26,7 +25,7 @@ SEED        = int(os.getenv("SEED", 42))
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gnn_ckpt    = '/mnt/data/gcn_contextpred.pth' if GNN=="gcn" else '/mnt/data/gin_contextpred.pth'
 RETURN_SEQS = os.getenv("RETURN_SEQUENCES", "true").lower() == "true"   # use full sequences
-GENE_POOL_F = int(os.getenv("GENE_POOL_FACTOR", 8))                      # 8× sliding window for gene
+GENE_POOL_F = int(os.getenv("GENE_POOL_FACTOR", 4))                      # 8× sliding window for gene
 MAX_NODES   = int(os.getenv("MAX_NODES", 50))
 
 torch.set_num_threads(1)
@@ -40,7 +39,10 @@ with open(DRUG_CACHE, "rb") as f:
     graph_cache = pickle.load(f)
 
 dataset = ProteinDrugInteractionDataset(
-    df, LMDB_DIR, GENE_TO_LMDB_JSON, graph_cache,
+    seg_df=df,
+    lmdb_path=LMDB_DIR,
+    smiles_cache=graph_cache,
+    verbose=True
 )
 
 idx = np.arange(len(dataset))
@@ -62,6 +64,8 @@ train_loader = DataLoader(
     persistent_workers=(NUM_WORKERS > 0),
     prefetch_factor=(4 if NUM_WORKERS > 0 else None),
 )
+
+print(f"[TRAIN] batch_size={BATCH_SIZE} steps_per_epoch={len(train_loader)}")
 
 # sanity check one batch
 sanity_loader = DataLoader(train_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=collate_fn)
@@ -99,24 +103,19 @@ run_cfg = {
     "device":str(DEVICE)
 }
 
-run_cfg.update({
-    "return_sequences": RETURN_SEQS,
-    "gene_pool_factor": GENE_POOL_F,
-    "max_nodes": MAX_NODES,
-})
-print("[CONFIG]", json.dumps(run_cfg, indent=2))
-
 best_val = float("inf"); best_state=None
 for ep in range(1, EPOCHS+1):
     model.train()
     t0 = time.time()
     tot=0.0; nb=0
     for b in train_loader:
-        p = b["protein_embeddings"].to(DEVICE)
-        d = b["drug_graphs"].to(DEVICE)
-        y = b["direction_ids"].to(DEVICE)
+        p   = b["protein_embeddings"].to(DEVICE)
+        pm  = b["protein_pad_mask"].to(DEVICE)
+        y   = b["direction_ids"].to(DEVICE)
+
         opt.zero_grad(set_to_none=True)
-        logits = model(p, d)
+        logits = model(p_vec=p, batch_data=b["drug_graphs"], p_mask=pm)
+
         loss = crit(logits, y)
         loss.backward(); opt.step()
         tot += loss.item(); nb += 1
@@ -127,10 +126,12 @@ for ep in range(1, EPOCHS+1):
         vtot=0.0; vnb=0
         with torch.no_grad():
             for b in val_loader:
-                p = b["protein_embeddings"].to(DEVICE)
-                d = b["drug_graphs"].to(DEVICE)
-                y = b["direction_ids"].to(DEVICE)
-                logits = model(p, d)
+                p   = b["protein_embeddings"].to(DEVICE)
+                pm  = b["protein_pad_mask"].to(DEVICE)
+                y   = b["direction_ids"].to(DEVICE)
+
+                logits = model(p_vec=p, batch_data=b["drug_graphs"], p_mask=pm)
+
                 loss = crit(logits, y)
                 vtot += loss.item(); vnb += 1
         val_loss = vtot/max(1,vnb)

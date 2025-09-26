@@ -36,18 +36,26 @@ class CrossAttnBlock(nn.Module):
         self.ca = nn.MultiheadAttention(d, nheads, batch_first=True)
         self.ff = nn.Sequential(nn.Linear(d, ff*d), nn.GELU(), nn.Linear(ff*d, d))
         self.ln1 = nn.LayerNorm(d); self.ln2 = nn.LayerNorm(d); self.ln3 = nn.LayerNorm(d)
-    def forward(self, p, d):
-        x = torch.cat([p,d], dim=1)
-        x = self.ln1(x + self.sa(x,x,x,need_weights=False)[0])
-        p2 = self.ca(p, d, d, need_weights=False)[0]
-        d2 = self.ca(d, p, p, need_weights=False)[0]
-        x2 = torch.cat([p2,d2], dim=1)
+
+    def forward(self, p, d, p_mask=None, d_mask=None):
+        x = torch.cat([p, d], dim=1)                   # [B, Tp+Td, D]
+        if p_mask is None:
+            p_mask = torch.zeros(p.size(0), p.size(1), dtype=torch.bool, device=p.device)
+        if d_mask is None:
+            d_mask = torch.zeros(d.size(0), d.size(1), dtype=torch.bool, device=d.device)
+        concat_mask = torch.cat([p_mask, d_mask], dim=1)  # [B, Tp+Td], True=PAD
+
+        x = self.ln1(x + self.sa(x, x, x, key_padding_mask=concat_mask, need_weights=False)[0])
+        p2 = self.ca(p, d, d, key_padding_mask=d_mask, need_weights=False)[0]
+        d2 = self.ca(d, p, p, key_padding_mask=p_mask, need_weights=False)[0]
+        x2 = torch.cat([p2, d2], dim=1)
         x = self.ln2(x + x2)
         x = self.ln3(x + self.ff(x))
-        # Modified: handle variable sequence lengths
-        p_len, d_len = p.shape[1], d.shape[1]
-        p_out, d_out = x[:,:p_len], x[:,p_len:p_len+d_len]
+
+        Tp = p.size(1)
+        p_out, d_out = x[:, :Tp], x[:, Tp:]
         return p_out, d_out
+
 
 class BilinearGate(nn.Module):
     def __init__(self, d):
@@ -67,26 +75,40 @@ class BilinearGate(nn.Module):
         return fuse
 
 def batch_to_sequence(node_features, batch, max_nodes=None):
-    """Convert batched node features to padded sequences for each graph."""
-    batch_size = batch.max().item() + 1
-    lengths = torch.bincount(batch, minlength=batch_size)  # CHANGED: added to compute sizes
-
+    B = int(batch.max().item()) + 1
+    lengths = torch.bincount(batch, minlength=B)
     if max_nodes is None:
-        # Find max number of nodes in any graph
-        max_nodes = lengths.max().item()  # CHANGED: use lengths instead of redefining cap
-    
-    # Initialize padded tensor
-    d = node_features.shape[-1]
-    seq = torch.zeros(batch_size, max_nodes, d, device=node_features.device)
+        max_nodes = int(lengths.max().item())
 
-    # Fill in the sequences
-    for b in range(batch_size):
-        nodes_b = node_features[batch == b]
-        n = min(nodes_b.shape[0], max_nodes)        # CHANGED: truncate if needed
+    d = node_features.size(-1)
+    seq = node_features.new_zeros(B, max_nodes, d)
+    pad_mask = torch.ones(B, max_nodes, dtype=torch.bool, device=node_features.device)
+
+    for b in range(B):
+        idx = (batch == b).nonzero(as_tuple=False).squeeze(1)
+        n = min(int(lengths[b].item()), max_nodes)
         if n > 0:
-            seq[b, :n] = nodes_b[:n]               # CHANGED: safe assign
+            seq[b, :n] = node_features.index_select(0, idx)[:n]
+            pad_mask[b, :n] = False
 
-    return seq
+    return seq, pad_mask  # True=PAD
+
+class MLPHead(nn.Module):
+    def __init__(self, in_dim=512, hidden=256, n_classes=2, dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, n_classes)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 
 class DrugGeneEncoder(nn.Module):
     def __init__(self, dim_p=768, emb_dim=300, d_model=512, gnn_ckpt=None, freeze_gnn=True, 
@@ -122,42 +144,56 @@ class DrugGeneEncoder(nn.Module):
             nn.Linear(5*d_model, 1024), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(1024, 512), nn.GELU(), nn.LayerNorm(512)
         )
-    
-    def forward(self, p_vec, batch_data):
+
+    def forward(self, p_vec, batch_data=None, drug_node_seq=None, p_mask=None, d_mask=None):
         device = p_vec.device
-        batch_data = batch_data.to(device)
-        
-        # Handle gene embeddings - can be sequences or pooled vectors
-        if p_vec.dim() == 2:  # [B, dim_p] - pooled vectors
-            p = self.pproj(p_vec).unsqueeze(1)  # [B, 1, d_model]
-        else:  # [B, seq_len, dim_p]
-            p = self.pproj(p_vec)                      # [B, Tp, d_model]
-            if self.gene_pool is not None and p.size(1) > 1:
-                p = self.gene_pool(p)  
-        
-        # Get drug embeddings
-        if self.return_sequences:
-            # Modified: get node-level features and convert to sequences
-            node_features, batch = self.gnn(batch_data)
-            d_seq = batch_to_sequence(node_features, batch, self.max_nodes)  # [B, max_nodes, emb_dim]
-            d = self.dproj(d_seq)  # [B, max_nodes, d_model]
+
+        # --- gene path ---
+        if p_vec.dim() == 2:
+            p = self.pproj(p_vec).unsqueeze(1)
+            if p_mask is None:
+                p_mask = torch.zeros(p.size(0), 1, dtype=torch.bool, device=p.device)
         else:
-            d_vec = self.gnn(batch_data)  # [B, emb_dim]
-            d = self.dproj(d_vec).unsqueeze(1)  # [B, 1, d_model]
-        
-        # Cross-attention if enabled
+            p = self.pproj(p_vec)                                  # [B,Tp,D]
+            if self.gene_pool is not None and p.size(1) > 1:
+                p = self.gene_pool(p)                              # window pool → new T
+                p_mask = torch.zeros(p.size(0), p.size(1), dtype=torch.bool, device=p.device)
+            else:
+                if p_mask is None:
+                    p_mask = torch.zeros(p.size(0), p.size(1), dtype=torch.bool, device=p.device)
+
+        # --- drug path: ALWAYS from GNN when return_sequences=True ---
+        if self.return_sequences:
+            assert batch_data is not None, "Provide batch_data (PyG Batch/Data) when return_sequences=True"
+            batch_data = batch_data.to(device)
+            node_features, pyg_batch = self.gnn(batch_data)        # node_features: [N,D_emb]
+            d_seq, d_mask = batch_to_sequence(node_features, pyg_batch, self.max_nodes)  # [B,Td,emb_dim], [B,Td]
+            d = self.dproj(d_seq)                                  # [B,Td,D]
+        else:
+            # pooled path
+            if batch_data is not None:
+                batch_data = batch_data.to(device)
+                d_vec = self.gnn(batch_data)                       # [B,emb_dim]
+            else:
+                # extreme fallback only if you intentionally provide a precomputed vector
+                d_vec = drug_node_seq.mean(dim=1) if drug_node_seq is not None else None
+                assert d_vec is not None, "Provide batch_data or a pooled drug vector"
+            d = self.dproj(d_vec).unsqueeze(1)
+            d_mask = torch.zeros(d.size(0), 1, dtype=torch.bool, device=d.device)
+
+        # --- cross-attention ---
         if self.use_xattn and hasattr(self, "xblk"):
-            p, d = self.xblk(p, d)
-            
+            p, d = self.xblk(p, d, p_mask=p_mask, d_mask=d_mask)
             if self.return_sequences:
-                # Added: learnable pooling after cross-attention
-                p = torch.tanh(self.p_pool(p.mean(dim=1, keepdim=True)))  # [B, 1, d_model]
-                d = torch.tanh(self.d_pool(d.mean(dim=1, keepdim=True)))  # [B, 1, d_model]
-        
-        # Final fusion and output
-        h = self.trunk(self.bgate(p, d))
+                p = torch.tanh(self.p_pool(p.mean(dim=1, keepdim=True)))
+                d = torch.tanh(self.d_pool(d.mean(dim=1, keepdim=True)))
+
+        h = self.trunk(self.bgate(p, d))                           # [B,512]
         return h
 
+
+    
+    
 class GeneDrugTargetClassifier(nn.Module):
     def __init__(self, dim_p=768, emb_dim=300, d_model=512, gnn_ckpt=None, freeze_gnn=True, 
                  gnn_type='gcn', use_xattn=False, n_classes=2, return_sequences=False):
@@ -175,11 +211,15 @@ class ExpressionDirectionClassifier(nn.Module):
     def __init__(self, dim_p=768, emb_dim=300, d_model=512, gnn_ckpt=None, freeze_gnn=True, 
                  gnn_type='gcn', use_xattn=False, n_classes=2, return_sequences=False):
         super().__init__()
-        # Added: return_sequences parameter
-        self.encoder = DrugGeneEncoder(dim_p, emb_dim, d_model, gnn_ckpt, freeze_gnn, 
+        self.encoder = DrugGeneEncoder(dim_p, emb_dim, d_model, gnn_ckpt, freeze_gnn,
                                        gnn_type, use_xattn, return_sequences)
-        self.head = nn.Linear(512, n_classes)
+        self.head = MLPHead(in_dim=512, hidden=256, n_classes=n_classes, dropout=0.3)
+
     
-    def forward(self, p_vec, batch_data):
-        h = self.encoder(p_vec, batch_data)
-        return self.head(h)  # [B,2]
+    def forward(self, p_vec, batch_data=None, drug_node_seq=None, p_mask=None, d_mask=None):
+        h = self.encoder(p_vec,
+                        batch_data=batch_data,
+                        drug_node_seq=None,  # not used in this path
+                        p_mask=p_mask,
+                        d_mask=d_mask)
+        return self.head(h)
