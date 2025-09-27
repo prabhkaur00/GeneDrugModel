@@ -119,7 +119,7 @@ class DrugGeneEncoder(nn.Module):
         self.max_nodes = max_nodes  # Added: max nodes for drug graphs
         self.max_genes = max_genes  # Added: max length for gene sequences
         self.gene_pool_factor = gene_pool_factor  # Added: pooling factor for gene sequences
-        
+        self.freeze_gnn = freeze_gnn
         # Modified: use 'none' pooling to get node-level features when needed
         pooling_type = 'none' if return_sequences else 'attention'
         self.gnn = GNN_graphpred(5, emb_dim, emb_dim, graph_pooling=pooling_type, gnn_type=gnn_type)
@@ -166,7 +166,9 @@ class DrugGeneEncoder(nn.Module):
         if self.return_sequences:
             assert batch_data is not None, "Provide batch_data (PyG Batch/Data) when return_sequences=True"
             batch_data = batch_data.to(device)
-            node_features, pyg_batch = self.gnn(batch_data)        # node_features: [N,D_emb]
+            with torch.no_grad():
+                    node_features, pyg_batch = self.gnn(batch_data)
+            # node_features, pyg_batch = self.gnn(batch_data)        # node_features: [N,D_emb]
             d_seq, d_mask = batch_to_sequence(node_features, pyg_batch, self.max_nodes)  # [B,Td,emb_dim], [B,Td]
             d = self.dproj(d_seq)                                  # [B,Td,D]
         else:
@@ -190,6 +192,12 @@ class DrugGeneEncoder(nn.Module):
 
         h = self.trunk(self.bgate(p, d))                           # [B,512]
         return h
+    
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_gnn:
+            self.gnn.eval()
+        return self
 
 
     

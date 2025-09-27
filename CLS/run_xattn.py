@@ -7,6 +7,9 @@ from torch.utils.data import DataLoader, Subset
 import multiprocessing as mp
 from loader_xattn import ProteinDrugInteractionDataset, collate_fn
 from model_xattn import ExpressionDirectionClassifier  # from your refactor
+from collections import Counter
+from sklearn.metrics import roc_auc_score, average_precision_score
+
 
 CSV_PATH    = os.getenv("CSV_PATH", "/mnt/data/direction_lt500.csv")
 LMDB_DIR   = os.getenv("LMDB_PATH", "/mnt/data/filtered_lt500.lmdb")
@@ -34,6 +37,8 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.man
 
 df = pd.read_csv(CSV_PATH)
 df = df[(df["target_id"] == 0) & (df["direction_id"].isin([0,1]))].reset_index(drop=True)
+ctr = Counter(df["direction_id"].tolist())
+print(f"[DATA] N={len(df)}  class_counts={dict(ctr)}  pos_ratio={ctr.get(1,0)/max(1,sum(ctr.values())):.4f}")
 
 with open(DRUG_CACHE, "rb") as f:
     graph_cache = pickle.load(f)
@@ -67,11 +72,13 @@ train_loader = DataLoader(
 
 print(f"[TRAIN] batch_size={BATCH_SIZE} steps_per_epoch={len(train_loader)}")
 
-# sanity check one batch
-# sanity_loader = DataLoader(train_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=collate_fn)
-# b = next(iter(sanity_loader))
-# pe = b["protein_embeddings"]
-# assert pe.shape[-1] == 768
+# --- label dtype sanity: first batch check ---
+_sanity_loader = DataLoader(train_set, batch_size=4, shuffle=False, num_workers=0, collate_fn=collate_fn)
+_b = next(iter(_sanity_loader))
+_y = _b["direction_ids"]
+print(f"[SANITY] y.shape={tuple(_y.shape)} y.dtype={_y.dtype} unique={pd.Series(_y.numpy() if hasattr(_y,'numpy') else _y).unique()}")
+del _sanity_loader, _b, _y
+
 
 val_loader = None if val_set is None else DataLoader(
     val_set,
@@ -102,44 +109,94 @@ run_cfg = {
     "seed":SEED,
     "device":str(DEVICE)
 }
+def epoch_metrics(all_logits, all_y):
+    if not all_logits:
+        return dict(acc=float("nan"), pos_recall=float("nan"), neg_recall=float("nan"),
+                    mu=float("nan"), sd=float("nan"), auc=float("nan"), auprc=float("nan"))
+    y = torch.cat(all_y).detach().cpu().long()
+    logits = torch.cat(all_logits).detach().cpu()
+    probs = logits.softmax(dim=-1)[:, 1]
+    preds = logits.argmax(dim=-1)
+
+    acc = (preds == y).float().mean().item()
+    c = Counter(y.tolist())
+    pos = c.get(1, 0); neg = c.get(0, 0)
+    pos_recall = ((preds[y == 1] == 1).float().mean().item()) if pos > 0 else float('nan')
+    neg_recall = ((preds[y == 0] == 0).float().mean().item()) if neg > 0 else float('nan')
+    mu, sd = logits.mean().item(), logits.std().item()
+    try:
+        auc = roc_auc_score(y.numpy(), probs.numpy()) if len(set(y.numpy())) > 1 else float('nan')
+        auprc = average_precision_score(y.numpy(), probs.numpy()) if len(set(y.numpy())) > 1 else float('nan')
+    except Exception:
+        auc, auprc = float('nan'), float('nan')
+    return dict(acc=acc, pos_recall=pos_recall, neg_recall=neg_recall, mu=mu, sd=sd, auc=auc, auprc=auprc)
+
 
 best_val = float("inf"); best_state=None
 for ep in range(1, EPOCHS+1):
     model.train()
     t0 = time.time()
     tot=0.0; nb=0
+    all_logits_t, all_y_t = [], []
     for b in train_loader:
         p   = b["protein_embeddings"].to(DEVICE)
         pm  = b["protein_pad_mask"].to(DEVICE)
-        y   = b["direction_ids"].to(DEVICE)
+        y   = b["direction_ids"].to(DEVICE).long()  # CE needs Long
 
         opt.zero_grad(set_to_none=True)
         logits = model(p_vec=p, batch_data=b["drug_graphs"], p_mask=pm)
 
         loss = crit(logits, y)
         loss.backward(); opt.step()
+
         tot += loss.item(); nb += 1
+        all_logits_t.append(logits.detach())
+        all_y_t.append(y.detach())
     train_loss = tot/max(1,nb)
+    train_m = epoch_metrics(all_logits_t, all_y_t)
+
 
     if val_loader is not None:
         model.eval()
         vtot=0.0; vnb=0
+        all_logits_v, all_y_v = [], []
         with torch.no_grad():
             for b in val_loader:
                 p   = b["protein_embeddings"].to(DEVICE)
                 pm  = b["protein_pad_mask"].to(DEVICE)
-                y   = b["direction_ids"].to(DEVICE)
-
+                y   = b["direction_ids"].to(DEVICE).long()
                 logits = model(p_vec=p, batch_data=b["drug_graphs"], p_mask=pm)
 
                 loss = crit(logits, y)
                 vtot += loss.item(); vnb += 1
+                all_logits_v.append(logits)
+                all_y_v.append(y)
         val_loss = vtot/max(1,vnb)
+        val_m = epoch_metrics(all_logits_v, all_y_v)
+
     else:
         val_loss = train_loss
 
     dt = time.time()-t0
-    print(f"[E{ep}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} time_s={dt:.1f}")
+    print(
+        f"[E{ep}] "
+        f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+        f"train_acc={train_m['acc']:.3f} val_acc={val_m['acc']:.3f} "
+        f"posR={train_m['pos_recall']:.3f}/{val_m['pos_recall']:.3f} "
+        f"negR={train_m['neg_recall']:.3f}/{val_m['neg_recall']:.3f} "
+        f"val_logits_mu,sd={val_m['mu']:.3f},{val_m['sd']:.3f} "
+        f"AUC/AUPRC={val_m['auc']:.3f}/{val_m['auprc']:.3f} "
+        f"time_s={dt:.1f}")
+
+    if ep in (1, 2, 5) or ep % 10 == 0:
+        with torch.no_grad():
+            gnorms = []
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    gnorms.append((name, p.grad.norm().item()))
+            gnorms = sorted(gnorms, key=lambda x: -x[1])[:8]
+            print("[GRADS top8]", gnorms)
+
 
     if val_loss < best_val:
         best_val = val_loss
