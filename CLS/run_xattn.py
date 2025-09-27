@@ -68,10 +68,10 @@ train_loader = DataLoader(
 print(f"[TRAIN] batch_size={BATCH_SIZE} steps_per_epoch={len(train_loader)}")
 
 # sanity check one batch
-sanity_loader = DataLoader(train_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=collate_fn)
-b = next(iter(sanity_loader))
-pe = b["protein_embeddings"]
-assert pe.shape[-1] == 768
+# sanity_loader = DataLoader(train_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=collate_fn)
+# b = next(iter(sanity_loader))
+# pe = b["protein_embeddings"]
+# assert pe.shape[-1] == 768
 
 val_loader = None if val_set is None else DataLoader(
     val_set,

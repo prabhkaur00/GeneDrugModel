@@ -26,26 +26,26 @@ class ProteinDrugInteractionDataset(Dataset):
         self.df = seg_df.reset_index(drop=True)
         self.smiles_cache = smiles_cache
         self.lmdb_path = os.path.abspath(lmdb_path)
+        self.env = None  # Delay LMDB opening (important!)
+
         if not os.path.exists(self.lmdb_path):
             raise FileNotFoundError(self.lmdb_path)
-
-        # Open the filtered LMDB once
-        self.env = lmdb.open(
-            self.lmdb_path,
-            readonly=True,
-            lock=False,
-            readahead=True,
-            subdir=os.path.isdir(self.lmdb_path),
-            max_readers=2048,
-            max_dbs=1
-        )
 
         self.valid_indices = []
         missing_smiles = 0
         missing_key_in_env = 0
 
         if verify_keys:
-            with self.env.begin(buffers=False) as txn:
+            temp_env = lmdb.open(
+                self.lmdb_path,
+                readonly=True,
+                lock=False,
+                readahead=True,
+                subdir=os.path.isdir(self.lmdb_path),
+                max_readers=2048,
+                max_dbs=1
+            )
+            with temp_env.begin(buffers=False) as txn:
                 for idx, row in self.df.iterrows():
                     gid = _to_gene_key(row["gene_id"])
                     smi = row["smiles"]
@@ -56,6 +56,7 @@ class ProteinDrugInteractionDataset(Dataset):
                         missing_key_in_env += 1
                         continue
                     self.valid_indices.append(idx)
+            temp_env.close()
         else:
             for idx, row in self.df.iterrows():
                 gid = _to_gene_key(row["gene_id"])
@@ -70,10 +71,23 @@ class ProteinDrugInteractionDataset(Dataset):
             print(f"[Dataset] valid={len(self.valid_indices)} / {len(self.df)} "
                   f"(missing_smiles={missing_smiles}, missing_key_in_env={missing_key_in_env})", flush=True)
 
+    def _ensure_env(self):
+        if self.env is None:
+            self.env = lmdb.open(
+                self.lmdb_path,
+                readonly=True,
+                lock=False,
+                readahead=True,
+                subdir=os.path.isdir(self.lmdb_path),
+                max_readers=2048,
+                max_dbs=1
+            )
+
     def __len__(self):
         return len(self.valid_indices)
 
     def __getitem__(self, i):
+        self._ensure_env()
         df_idx = self.valid_indices[i]
         row = self.df.iloc[df_idx]
         gid = _to_gene_key(row["gene_id"])
@@ -84,10 +98,10 @@ class ProteinDrugInteractionDataset(Dataset):
             if buf is None:
                 raise KeyError(f"gene_id {gid} not found in LMDB")
             emb = np.load(io.BytesIO(buf), allow_pickle=False)
-            protein_embedding = torch.tensor(emb, dtype=torch.float32)
+        
+        protein_embedding = torch.tensor(emb, dtype=torch.float32)
 
         drug_graph = self.smiles_cache[smi]
-
         return {
             "protein": protein_embedding,
             "drug": drug_graph,
@@ -99,20 +113,13 @@ class ProteinDrugInteractionDataset(Dataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state['env'] = None
+        state['env'] = None  # Prevent LMDB sharing across processes
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self.env = lmdb.open(
-            self.lmdb_path,
-            readonly=True,
-            lock=False,
-            readahead=True,
-            subdir=os.path.isdir(self.lmdb_path),
-            max_readers=2048,
-            max_dbs=1
-        )
+        self.env = None  # Lazy re-init
+
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
