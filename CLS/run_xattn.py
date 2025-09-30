@@ -67,31 +67,14 @@ dataset = ProteinDrugInteractionDataset(
     verbose=False
 )
 
-# -----------------------------
-# Helper: safe index probe
-# -----------------------------
-def _safe_item_ok(ds, i):  # <<< ADDED
-    try:
-        _ = ds[i]
-        return True
-    except KeyError as e:
-        print(f"[SKIP] {e}")
-        return False
-    except Exception as e:
-        print(f"[SKIP-OTHER] idx={i} err={repr(e)}")
-        return False
-
 # Quick dataset sanity
 print("[VALIDATION] Checking first 10 samples...")
 sample_labels = []
 for i in range(min(10, len(dataset))):
-    try:  # <<< ADDED
-        s = dataset[i]  # <<< CHANGED (wrapped in try)
-        sample_labels.append(int(s["direction_id"]))
-        if torch.isnan(s["protein"]).any(): print(f"WARNING: NaN in protein at sample {i}")
-        if torch.isinf(s["protein"]).any(): print(f"WARNING: Inf in protein at sample {i}")
-    except Exception as e:  # <<< ADDED
-        print(f"[SANITY-SKIP] idx={i} err={repr(e)}")  # <<< ADDED
+    s = dataset[i]
+    sample_labels.append(int(s["direction_id"]))
+    if torch.isnan(s["protein"]).any(): print(f"WARNING: NaN in protein at sample {i}")
+    if torch.isinf(s["protein"]).any(): print(f"WARNING: Inf in protein at sample {i}")
 print(f"[SAMPLE_LABELS] First 10: {sample_labels}")
 print(f"[SAMPLE_DISTRIBUTION] {Counter(sample_labels)}")
 
@@ -102,11 +85,6 @@ val_idx = idx[:n_val] if n_val > 0 else []
 train_idx = idx[n_val:] if n_val > 0 else idx
 print(f"[SPLIT_CHECK] Train first 100: {Counter(df.iloc[train_idx[:100]]['direction_id'])}")
 print(f"[SPLIT_CHECK] Val first 100: {Counter(df.iloc[val_idx[:100]]['direction_id']) if len(val_idx)>0 else {}}")
-
-# Remove problematic samples that raise in __getitem__    # <<< ADDED
-train_idx = [int(i) for i in train_idx if _safe_item_ok(dataset, int(i))]  # <<< ADDED
-val_idx   = [int(i) for i in val_idx   if _safe_item_ok(dataset, int(i))] if len(val_idx) > 0 else []  # <<< ADDED
-print(f"[FILTERED_IDX] train={len(train_idx)} val={len(val_idx)}")  # <<< ADDED
 
 train_set, val_set = Subset(dataset, train_idx), (Subset(dataset, val_idx) if n_val > 0 else None)
 
@@ -122,13 +100,9 @@ print(f"[TRAIN] batch_size={BATCH_SIZE} steps_per_epoch={len(train_loader)} work
 
 # One batch check
 print("[LOADER_CHECK] First training batch distro…")
-try:  # <<< ADDED
-    _check = next(iter(DataLoader(train_set, batch_size=min(32, len(train_set)),
-                                  shuffle=False, num_workers=0, collate_fn=collate_fn)))
-    print(f"[BATCH_DISTRIBUTION] {dict(Counter(_check['direction_ids'].tolist()))}")
-    del _check
-except Exception as e:  # <<< ADDED
-    print(f"[LOADER_CHECK-SKIP] err={repr(e)}")  # <<< ADDED
+_check = next(iter(DataLoader(train_set, batch_size=min(32, len(train_set)), shuffle=False, num_workers=0, collate_fn=collate_fn)))
+print(f"[BATCH_DISTRIBUTION] {dict(Counter(_check['direction_ids'].tolist()))}")
+del _check
 
 # -----------------------------
 # Model / Optim / Loss / Sched
