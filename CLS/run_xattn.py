@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import roc_auc_score, average_precision_score
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR  # NEW
 
 from loader_xattn import ProteinDrugInteractionDataset, collate_fn
 from model_xattn import ExpressionDirectionClassifier
@@ -31,6 +32,10 @@ DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gnn_ckpt     = "/mnt/data/gcn_contextpred.pth" if GNN == "gcn" else "/mnt/data/gin_contextpred.pth"
 RETURN_SEQS  = os.getenv("RETURN_SEQUENCES", "true").lower() == "true"
 MAX_NODES    = int(os.getenv("MAX_NODES", 50))
+ATTN_DROPOUT = float(os.getenv("ATTN_DROPOUT", "0.10"))                 # NEW
+LOGIT_L2     = float(os.getenv("LOGIT_L2", "1e-4"))                      # NEW
+WARMUP_FRAC  = float(os.getenv("WARMUP_FRAC", "0.05"))                   # NEW
+EARLY_PATIENCE = int(os.getenv("EARLY_PATIENCE", "5"))                   # NEW
 
 # Determinism / env
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -110,27 +115,47 @@ del _check
 model = ExpressionDirectionClassifier(
     dim_p=768, emb_dim=300, d_model=512, gnn_ckpt=gnn_ckpt,
     freeze_gnn=FREEZE_GNN, gnn_type=GNN, use_xattn=USE_XATTN,
-    n_classes=2, return_sequences=RETURN_SEQS
+    n_classes=2, return_sequences=RETURN_SEQS,
+    attn_dropout=ATTN_DROPOUT
 ).to(DEVICE)
 
 # differential LRs
-head_params, backbone_params = [], []
+head_params, projattn_params, backbone_params = [], [], []     # CHANGED
 for n, p in model.named_parameters():
-    if not p.requires_grad: continue
-    (head_params if n.startswith("head.") else backbone_params).append(p)
+    if not p.requires_grad: 
+        continue
+    # heuristics for grouping, tuned to your naming
+    if n.startswith("head."):
+        head_params.append(p)
+    elif any(k in n for k in [
+        "pproj", "dproj", "xblk.sa.in_proj", "xblk.ca.in_proj",
+        "xblk.sa.out_proj", "xblk.ca.out_proj"
+    ]):
+        projattn_params.append(p)
+    else:
+        backbone_params.append(p)
 
 opt = torch.optim.AdamW(
-    [{'params': backbone_params, 'lr': LR * 0.1},
-     {'params': head_params,     'lr': LR}],
+    [
+      {'params': backbone_params,  'lr': LR * 0.1},
+      {'params': projattn_params,  'lr': LR / 3.0},            # NEW: ~⅓ base
+      {'params': head_params,      'lr': LR},
+    ],
     weight_decay=WEIGHT_DECAY
 )
 
 # Balanced data → plain CE
 crit = nn.CrossEntropyLoss()
 
-# We want to optimize AUC upward; ReduceLROnPlateau minimizes → step on negative AUC
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    opt, mode="min", factor=0.5, patience=5, verbose=True
+warmup_epochs = max(1, int(EPOCHS * WARMUP_FRAC))               # NEW
+main_epochs   = max(1, EPOCHS - warmup_epochs)                  # NEW
+scheduler = SequentialLR(                                       # NEW
+    opt,
+    schedulers=[
+        LinearLR(opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs),
+        CosineAnnealingLR(opt, T_max=main_epochs)
+    ],
+    milestones=[warmup_epochs]
 )
 
 def cleanup_memory():
@@ -169,7 +194,7 @@ def epoch_metrics(all_logits, all_y):
 # Train
 # -----------------------------
 best_auc = -float("inf"); best_state = None
-early_stop_patience = 10
+early_stop_patience = EARLY_PATIENCE    
 patience_counter = 0
 
 for ep in range(1, EPOCHS + 1):
@@ -189,6 +214,7 @@ for ep in range(1, EPOCHS + 1):
         opt.zero_grad(set_to_none=True)
         logits = model(p_vec=p, batch_data=b["drug_graphs"], p_mask=pm)
         loss = crit(logits, y)
+        loss = loss + LOGIT_L2 * (logits ** 2).mean()            
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"WARNING: Invalid loss at batch {batch_idx}: {loss.item()}"); cleanup_memory(); continue
@@ -205,7 +231,7 @@ for ep in range(1, EPOCHS + 1):
 
     train_loss = tot / max(1, nb)
     train_m = epoch_metrics(all_logits_t, all_y_t)
-
+         
     # Eval
     if val_loader is not None:
         model.eval()
@@ -227,8 +253,7 @@ for ep in range(1, EPOCHS + 1):
 
     # Scheduler & early-stop on AUC (maximize AUC → minimize -AUC)
     cur_auc = val_m["auc"] if val_m["auc"] == val_m["auc"] else -float("inf")  # handle NaN
-    scheduler.step(-cur_auc)
-
+    scheduler.step() 
     dt = time.time() - t0
     print(
         f"[E{ep}] "
