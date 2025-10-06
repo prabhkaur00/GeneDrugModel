@@ -18,6 +18,7 @@ We explore two key modeling setups:
   - Gene ID and DNA sequence
   - Description of interaction
   - Labels for interaction direction (increase, decrease, none) and type (e.g., expression, methylation)
+    Full dataset can be found here: https://drive.google.com/file/d/11xEVXHGkf-9xIkgsn6lW04DhDcXiHpkI/view?usp=drive_link
 
 - **Expression Modulation Task**  
   This work focuses on predicting **how** a drug modulates gene expression, which is a less commonly explored task than binary drug–target interaction (DTI) prediction. The dataset is filtered specifically for this direction-label prediction task.
